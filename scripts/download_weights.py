@@ -80,6 +80,39 @@ def download_realesrgan_weights() -> None:
         urllib.request.urlretrieve(url, out)
 
 
+def download_gfpgan_weights() -> None:
+    dest = ROOT / "weights" / "gfpgan"
+    dest.mkdir(parents=True, exist_ok=True)
+    urls = [
+        ("GFPGANv1.4.pth",
+         "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth"),
+    ]
+    for name, url in urls:
+        out = dest / name
+        if out.exists():
+            print(f"[gfpgan] already have {name}")
+            continue
+        print(f"[gfpgan] downloading {url}")
+        urllib.request.urlretrieve(url, out)
+    # facexlib face-detection weight (RetinaFace ResNet50) — auto-downloads
+    # on first use, but pre-fetch so the first inference run isn't slow.
+    facexlib_dest = ROOT / "weights" / "facexlib"
+    facexlib_dest.mkdir(parents=True, exist_ok=True)
+    fxlib_urls = [
+        ("detection_Resnet50_Final.pth",
+         "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth"),
+        ("parsing_parsenet.pth",
+         "https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth"),
+    ]
+    for name, url in fxlib_urls:
+        out = facexlib_dest / name
+        if out.exists():
+            print(f"[facexlib] already have {name}")
+            continue
+        print(f"[facexlib] downloading {url}")
+        urllib.request.urlretrieve(url, out)
+
+
 def check_rife() -> None:
     rife = ROOT / "RIFE_trained_v6" / "train_log" / "flownet.pkl"
     if rife.exists():
@@ -91,7 +124,9 @@ def check_rife() -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["flashvsr", "realesrgan", "all"], required=True)
+    p.add_argument("--model",
+                   choices=["flashvsr", "realesrgan", "gfpgan", "all"],
+                   required=True)
     args = p.parse_args()
 
     if args.model in ("flashvsr", "all"):
@@ -99,6 +134,8 @@ def main() -> int:
         download_flashvsr_weights()
     if args.model in ("realesrgan", "all"):
         download_realesrgan_weights()
+    if args.model in ("gfpgan", "all"):
+        download_gfpgan_weights()
     check_rife()
     return 0
 

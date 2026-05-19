@@ -1,16 +1,16 @@
 # UpScaling — Real-Time Video Super-Resolution
 
 Real-time video upscaling pipeline targeted at in-cabin driver-monitoring streams
-(704×576 @ ~30 FPS). Two interchangeable backends are provided:
+(704×576 @ ~30 FPS). Three interchangeable backends are provided:
 
 | Model | Native scale | Strength | When to use |
 |-------|--------------|----------|-------------|
-| **`flashvsr_tiny`** (FlashVSR-v1.1 Tiny) | 4× | Best quality, temporal-aware | Driver of the project |
-| **`realesrgan_lite`** (`realesr-general-x4v3`) | 4× | Lightweight, ~10 MB, faster on small GPUs | Fallback / baseline / sanity check |
+| **`realesrgan_gfpgan`** (Compact bg + GFPGAN-1.4 faces) | 4× | **Best perceptual quality for faces** — driver eyes/mouth/head-pose come out crisp; background handled by Compact | **Recommended for driver-monitoring on A100** |
+| **`flashvsr_tiny`** (FlashVSR-v1.1 Tiny) | 4× | Diffusion-class, temporal-aware | When you need temporal coherence and can afford 4 GB+ VRAM |
+| **`realesrgan_lite`** (`realesr-general-x4v3`) | 4× | Lightest (~10 MB), fastest per-frame | Throughput baseline / sanity check / multi-stream batching |
 
-Both go through the same pipeline (frame skipping, RIFE interpolation,
-SageAttention SDPA, optional int8 quantization), the same CLI, and the same
-output structure.
+All three share the same CLI, frame-skip + RIFE pipeline, SageAttention SDPA
+patch, output layout, and `run_info.txt` schema.
 
 ---
 
@@ -89,11 +89,27 @@ python -m src.infer --model realesrgan_lite --input "Real Test Video/1.mp4" \
     --frame-skip 2 --frame-interp rife
 ```
 
+### Real-ESRGAN + GFPGAN face restoration (recommended for driver monitoring)
+
+```bash
+# Native input (best quality, slow on 8 GB dev GPU)
+python -m src.infer --model realesrgan_gfpgan --input "Real Test Video/1.mp4" \
+    --seconds 3 --dtype fp16
+
+# Pre-resize + frame-skip for the laptop:
+python -m src.infer --model realesrgan_gfpgan --input "Real Test Video/1.mp4" \
+    --seconds 3 --pre-resize 50% --frame-skip 2 --frame-interp rife --dtype fp16
+```
+
+GFPGAN-1.4 weights (333 MB) and facexlib's RetinaFace-ResNet50 detector
+(104 MB) auto-download to `weights/gfpgan/` and `weights/facexlib/` on
+first use; pre-fetch with `python scripts/download_weights.py --model gfpgan`.
+
 ## 4. All CLI flags
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--model` | *required* | `flashvsr_tiny` or `realesrgan_lite` |
+| `--model` | *required* | `flashvsr_tiny`, `realesrgan_lite`, or `realesrgan_gfpgan` |
 | `--input` / `-i` | *required* | single video OR directory |
 | `--output` / `-o` | `output` | output root |
 | `--seconds` | `0` | seconds to process; `0` = full video |
@@ -170,22 +186,29 @@ UpScaling/
 ├── setup_linux.sh
 ├── .gitignore
 ├── src/
-│   ├── infer.py              # CLI entrypoint
-│   ├── runner.py             # per-video orchestration
-│   ├── io_utils.py           # video I/O + side-by-side
-│   ├── report.py             # run_info.txt writer
-│   ├── frame_skip.py         # skip + gap-fill
-│   ├── rife_interp.py        # RIFE-HDv3 wrapper
-│   ├── sage_patch.py         # SageAttention SDPA patch
+│   ├── infer.py                  # CLI entrypoint + interactive wizard
+│   ├── runner.py                 # per-video orchestration
+│   ├── io_utils.py               # video I/O + side-by-side
+│   ├── report.py                 # run_info.txt writer
+│   ├── frame_skip.py             # skip + gap-fill
+│   ├── rife_interp.py            # RIFE-HDv3 wrapper
+│   ├── sage_patch.py             # SageAttention SDPA patch
 │   └── models/
-│       ├── base.py           # Upscaler interface + registry
-│       ├── flashvsr_tiny.py  # FlashVSR-v1.1 Tiny wrapper
-│       └── realesrgan_lite.py# Real-ESRGAN alt wrapper
-├── scripts/download_weights.py
-├── third_party/FlashVSR/     # cloned by setup_linux.sh (gitignored)
-├── weights/realesrgan/       # downloaded by setup_linux.sh (gitignored)
-├── RIFE_trained_v6/          # checked-in RIFE-HDv3 weights
-└── Real Test Video/          # checked-in test clips
+│       ├── base.py               # Upscaler interface + registry
+│       ├── flashvsr_tiny.py      # FlashVSR-v1.1 Tiny wrapper
+│       ├── realesrgan_lite.py    # Real-ESRGAN baseline
+│       └── realesrgan_gfpgan.py  # Real-ESRGAN Compact + GFPGAN-1.4 face restore
+├── scripts/
+│   ├── download_weights.py
+│   ├── benchmark.py              # parameter sweep harness
+│   └── analyze_benchmark.py      # CSV → Markdown report
+├── benchmarks/latest/            # last sweep's CSV / JSON / REPORT.md
+├── third_party/FlashVSR/         # cloned by setup_linux.sh (gitignored)
+├── weights/realesrgan/           # downloaded by setup_linux.sh (gitignored)
+├── weights/gfpgan/               # GFPGANv1.4.pth (gitignored)
+├── weights/facexlib/             # RetinaFace ResNet50 + ParseNet (gitignored)
+├── RIFE_trained_v6/              # checked-in RIFE-HDv3 weights + ECCV source
+└── Real Test Video/              # checked-in test clips
 ```
 
 ## 9. Validated smoke-test configs (RTX 5050, 8 GB)
@@ -196,6 +219,16 @@ UpScaling/
 | `flashvsr_tiny` | `160x128` | 1 | none | on | none | 8.25 | 640×512 |
 | `flashvsr_tiny` | `160x128` | 2 | repeat | on | none | **14.4** | 640×512 |
 | `flashvsr_tiny` | `160x128` | 2 | rife | on | none | 12.6 | 640×512 |
+| `realesrgan_gfpgan` | `none` (704×576) | 1 | none | – | none | 1.78 | **2816×2304** |
+
+Best per-knob results from the 211-run benchmark (`benchmarks/latest/`):
+
+- **`realesrgan_lite` @ scale 2, pr 35 %, skip 4, fp16** — 48.5 fps, 175 MB
+- **`flashvsr_tiny` @ scale 2, pr 15 %, skip 3, bf16, sage off** — 38.2 fps, 4.2 GB
+
+A100 projections: each backend ~10-20× the laptop FPS at native resolution,
+putting `realesrgan_gfpgan` comfortably above 30 fps for in-cabin
+704×576 → 2816×2304 with the driver's face restored by GFPGAN.
 
 Notes:
 - FlashVSR Tiny is fixed 4× and the spatial input must be a multiple of 128

@@ -16,6 +16,8 @@ env/
 third_party/FlashVSR/
 third_party/Block-Sparse-Attention/
 third_party/SageAttention/
+third_party/RIFE/
+third_party/Practical-RIFE/
 
 # Weights
 weights/
@@ -37,3 +39,6 @@ __MACOSX/
 # Logs
 *.log
 nohup.out
+
+# gfpgan stashes facexlib weights here when run via the bg_upsampler path
+gfpgan/weights/

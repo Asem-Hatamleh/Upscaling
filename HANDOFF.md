@@ -16,8 +16,18 @@ and **suggested next steps**.
   - skip 1, interp none: **8.25 FPS**.
   - skip 2, interp repeat: **14.4 FPS**.
   - skip 2, interp rife: **12.6 FPS** (visibly smoother).
-- All three outputs (upscaled.mp4 / comparison.mp4 / run_info.txt) land in
-  the deterministic `output/<model>/<stem>_<args>/` folder.
+- `realesrgan_gfpgan` smoke test (the new face-aware backend): 3 s of 1.mp4 →
+  **1.78 FPS** at full 704×576 → 2816×2304 SR, peak VRAM 1.3 GB. Slow on
+  the laptop because both stages run at full output resolution (Compact
+  upscales background 4×, GFPGAN restores 512×512 face crops, paste-back).
+  On A100 this is expected to land at 30–60 FPS based on Compact-TRT
+  benchmarks and the GFPGAN-1.4 published timings.
+- 211-run automated benchmark sweep recorded under `benchmarks/latest/`:
+  top realesrgan_lite **48.5 FPS** @ 175 MB VRAM, top flashvsr_tiny
+  **38.2 FPS** @ 4.2 GB. See `benchmarks/latest/REPORT.md`.
+- All four outputs (`upscaled.mp4`, `comparison.mp4`, `run_info.txt`,
+  per-folder naming convention) land in
+  `output/<model>/<stem>_<args>/`.
 
 ### Discovered & fixed during this session
 
@@ -58,6 +68,23 @@ and **suggested next steps**.
 
 ### Still open / known unknowns
 
+- **`realesrgan_gfpgan` on RTX 5050 is slow** (1.78 FPS at native input).
+  Two bottlenecks: GFPGAN-1.4's RetinaFace-ResNet50 detector (~25 ms/frame)
+  and Compact at full 4× output (~150 ms on RTX 5050). On A100, swap
+  Compact for the TensorRT INT8 export (~8 ms) and the detector for
+  SCRFD-2.5G via InsightFace (~5 ms with five landmarks bundled) — the
+  rest of the pipeline is unchanged. Expected ~30 FPS single-stream and
+  ~50 FPS batched.
+- **SCRFD detector swap** for `realesrgan_gfpgan` is a TODO. The wrapper
+  takes a `face_detector` extra (defaults to RetinaFace ResNet50, falls
+  back to anything `facexlib.init_detection_model` accepts). Hooking up
+  `insightface.app.FaceAnalysis(name="buffalo_l")` would give us SCRFD +
+  ArcFace ID + age/gender from a single detector, but that's an A100
+  branch — laptop wins nothing.
+- **Compact + RIFE at 2816×2304 OOMs the laptop.** The
+  `realesrgan_gfpgan` smoke run at `--frame-skip 2 --frame-interp rife`
+  was killed (exit 137). For the laptop, run with `--pre-resize 50%` or
+  smaller when stacking RIFE on top of the face pipeline.
 - **`nf4` quantization is a stub.** Only `int8_woq` (bitsandbytes Linear8bitLt)
   is wired up. `--quant nf4` is silently ignored.
 - **Block-Sparse-Attention not built.** Would need `apt install nvidia-cuda-toolkit`

@@ -37,10 +37,14 @@ torchmetrics>=1.0
 pytorch-lightning>=2.0
 pandas>=2.0
 
-# --- Real-ESRGAN alt model ---
+# --- Real-ESRGAN alt model + GFPGAN face restoration backend ---
+# `realesrgan_gfpgan` stacks Compact (background) + GFPGAN-1.4 (faces) and
+# uses facexlib's RetinaFace detector under the hood. All four pip pkgs are
+# required when running that backend.
 realesrgan>=0.3.0
 basicsr>=1.4.2
 gfpgan>=1.3.8
+facexlib>=0.3.0
 
 # --- Optional perf ---
 # SageAttention (Linux only) — install from source for your CUDA:
