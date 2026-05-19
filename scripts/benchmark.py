@@ -220,7 +220,7 @@ def _parse_run_info(p: Path) -> dict[str, str]:
 
 
 _PEAK_RE = re.compile(r"peak_vram_mb=(\d+)")
-_OUT_RE = re.compile(r"-> (output/[^\s]+)")
+_OUT_RE = re.compile(r"-> (\S*output/\S+)")
 
 
 def run_one(cfg: RunCfg, output_root: Path, timeout: float = 360.0) -> RunResult:
@@ -245,8 +245,15 @@ def run_one(cfg: RunCfg, output_root: Path, timeout: float = 360.0) -> RunResult
         # Out dir from stdout
         mo = _OUT_RE.search(proc.stdout or "")
         if mo:
-            res.out_dir = mo.group(1)
-            info = ROOT / res.out_dir / "run_info.txt"
+            raw = mo.group(1)
+            # store relative-to-project-root if possible
+            try:
+                rel = Path(raw).resolve().relative_to(ROOT)
+                res.out_dir = str(rel)
+            except Exception:
+                res.out_dir = raw
+            info_abs = Path(raw) if Path(raw).is_absolute() else (ROOT / raw)
+            info = info_abs / "run_info.txt"
             if info.exists():
                 info_map = _parse_run_info(info)
                 # values shown in run_info.txt
@@ -264,17 +271,34 @@ def run_one(cfg: RunCfg, output_root: Path, timeout: float = 360.0) -> RunResult
                         res.peak_vram_mb = int(info_map.get("peak_vram_mb", "0"))
                     except Exception:
                         pass
-                up = ROOT / res.out_dir / "upscaled.mp4"
-                cmp = ROOT / res.out_dir / "comparison.mp4"
+                up = info_abs / "upscaled.mp4"
+                cmp = info_abs / "comparison.mp4"
                 if up.exists():
-                    res.upscaled_path = str(up.relative_to(ROOT))
+                    try:
+                        res.upscaled_path = str(up.relative_to(ROOT))
+                    except Exception:
+                        res.upscaled_path = str(up)
                 if cmp.exists():
-                    res.comparison_path = str(cmp.relative_to(ROOT))
+                    try:
+                        res.comparison_path = str(cmp.relative_to(ROOT))
+                    except Exception:
+                        res.comparison_path = str(cmp)
         if proc.returncode == 0 and res.e2e_fps > 0:
             res.status = "ok"
         else:
-            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
-            res.error = " | ".join(tail)
+            # Filter to lines that actually carry signal (skip tqdm carriage-return spam).
+            err_text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+            sig_lines = []
+            for line in err_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if any(tag in line for tag in ("[infer]", "FAILED", "Error", "Traceback",
+                                               "OutOfMemoryError", "Exception", "AssertionError",
+                                               "RuntimeError", "raise ", "  File ")):
+                    sig_lines.append(line)
+            res.error = " | ".join(sig_lines[-5:]) if sig_lines else \
+                       " | ".join(err_text.strip().splitlines()[-3:])
             if "out of memory" in res.error.lower():
                 res.status = "oom"
             else:
@@ -341,10 +365,27 @@ def write_json(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _to_int(v) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+
 def write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     ok = [r for r in rows if r["status"] == "ok"]
     oom = [r for r in rows if r["status"] == "oom"]
     err = [r for r in rows if r["status"] in ("error", "timeout")]
+    for r in ok:
+        r["e2e_fps"] = _to_float(r["e2e_fps"])
+        r["peak_vram_mb"] = _to_int(r["peak_vram_mb"])
     lines = []
     lines.append(f"runs: {len(rows)}  ok: {len(ok)}  oom: {len(oom)}  error: {len(err)}")
     lines.append("")
@@ -391,16 +432,34 @@ def main() -> int:
                     help="cap total runs (0 = no cap, useful for smoke)")
     ap.add_argument("--dry-run", action="store_true",
                     help="just print the plan, don't execute")
+    ap.add_argument("--resume", default=None,
+                    help="path to existing runs.csv; skip labels already recorded "
+                         "and append remaining runs to the same directory")
     args = ap.parse_args()
 
     if not INPUT_VIDEO.exists():
         print(f"input video not found: {INPUT_VIDEO}", file=sys.stderr)
         return 1
 
-    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_root = Path(args.out) / ts
-    out_root.mkdir(parents=True, exist_ok=True)
-    csv_path = out_root / "runs.csv"
+    done_labels: set[str] = set()
+    if args.resume:
+        resume_csv = Path(args.resume)
+        if not resume_csv.exists():
+            print(f"resume csv not found: {resume_csv}", file=sys.stderr)
+            return 1
+        out_root = resume_csv.parent
+        csv_path = resume_csv
+        with csv_path.open() as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row.get("label"):
+                    done_labels.add(row["label"])
+        print(f"[bench] resume mode: {len(done_labels)} labels already in {csv_path}")
+    else:
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = Path(args.out) / ts
+        out_root.mkdir(parents=True, exist_ok=True)
+        csv_path = out_root / "runs.csv"
     json_path = out_root / "runs.json"
     summary_path = out_root / "summary.txt"
 
@@ -411,10 +470,12 @@ def main() -> int:
     if "realesrgan_lite" in models:
         runs.extend(gen_realesrgan_runs())
 
+    if done_labels:
+        runs = [r for r in runs if r.label not in done_labels]
     if args.limit > 0:
         runs = runs[: args.limit]
 
-    print(f"[bench] {len(runs)} runs queued. ts={ts} out={out_root}")
+    print(f"[bench] {len(runs)} runs queued. out={out_root}")
 
     if args.dry_run:
         for i, r in enumerate(runs):
@@ -422,7 +483,28 @@ def main() -> int:
         return 0
 
     rows: list[dict[str, Any]] = []
+    if args.resume and csv_path.exists():
+        with csv_path.open() as f:
+            for row in csv.DictReader(f):
+                # Re-cast numeric fields so write_summary's sort keys work.
+                for k in ("e2e_fps", "wall_time_s", "esrgan_denoise",
+                          "topk_ratio", "kv_ratio"):
+                    if row.get(k):
+                        try:
+                            row[k] = float(row[k])
+                        except Exception:
+                            row[k] = 0.0
+                for k in ("peak_vram_mb", "exit_code", "source_frames",
+                          "sr_frames", "scale", "frame_skip", "chunk_frames",
+                          "local_range", "crf"):
+                    if row.get(k):
+                        try:
+                            row[k] = int(row[k])
+                        except Exception:
+                            row[k] = 0
+                rows.append(row)
     started = time.perf_counter()
+    csv_exists = csv_path.exists() and csv_path.stat().st_size > 0
     for i, cfg in enumerate(runs):
         t0 = time.perf_counter()
         print(f"[bench] {i+1:3d}/{len(runs)} {cfg.label}  pr={cfg.pre_resize} "
@@ -432,7 +514,8 @@ def main() -> int:
         dt = time.perf_counter() - t0
         flat = _flatten(r)
         rows.append(flat)
-        append_csv(csv_path, flat, write_header=(i == 0))
+        append_csv(csv_path, flat, write_header=not csv_exists)
+        csv_exists = True
         write_json(json_path, rows)
         write_summary(summary_path, rows)
         print(f"        {r.status}  fps={r.e2e_fps:6.2f}  vram={r.peak_vram_mb:>5} MB  "

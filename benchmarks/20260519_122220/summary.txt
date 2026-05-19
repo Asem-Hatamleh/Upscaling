@@ -1,0 +1,32 @@
+runs: 211  ok: 153  oom: 0  error: 58
+
+top 10 by e2e_fps:
+   48.52 fps  vram=  175 MB  realesrgan_lite  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   46.56 fps  vram=  182 MB  realesrgan_lite  scale=2 pr=35%   sk=4 sage=False quant=none     dt=bf16  -> output/realesrgan_lite/1_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   46.56 fps  vram=  182 MB  realesrgan_lite  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_lite/1_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   43.81 fps  vram=  288 MB  realesrgan_lite  scale=4 pr=25%   sk=2 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale4x_176x144_skip2_interp-rife_q-none_sage-off/upscaled.mp4
+   42.89 fps  vram=  288 MB  realesrgan_lite  scale=4 pr=25%   sk=2 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale4x_176x144_skip2_interp-rife_q-none_sage-off/upscaled.mp4
+   40.33 fps  vram=  175 MB  realesrgan_lite  scale=2 pr=35%   sk=2 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale2x_246x202_skip2_interp-rife_q-none_sage-off/upscaled.mp4
+   39.67 fps  vram=  175 MB  realesrgan_lite  scale=2 pr=35%   sk=3 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale2x_246x202_skip3_interp-rife_q-none_sage-off/upscaled.mp4
+   39.02 fps  vram=  288 MB  realesrgan_lite  scale=4 pr=25%   sk=2 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale4x_176x144_skip2_interp-rife_q-none_sage-off/upscaled.mp4
+   38.77 fps  vram=   72 MB  realesrgan_lite  scale=4 pr=35%   sk=1 sage=False quant=none     dt=fp16  -> output/realesrgan_lite/1_sec3_scale4x_246x202_skip1_interp-rife_q-none_sage-off/upscaled.mp4
+   38.17 fps  vram= 4218 MB  flashvsr_tiny   scale=2 pr=15%   sk=3 sage=False quant=none     dt=bf16  -> output/flashvsr_tiny/1_sec3_scale2x_106x86_skip3_interp-rife_q-none_sage-off/upscaled.mp4
+
+smallest VRAM among ok runs:
+  vram=   72 MB  fps=33.92  realesrgan_lite  35%  sk=1
+  vram=   72 MB  fps=38.77  realesrgan_lite  35%  sk=1
+  vram=  102 MB  fps=16.65  realesrgan_lite  50%  sk=1
+  vram=  102 MB  fps=20.66  realesrgan_lite  50%  sk=1
+  vram=  103 MB  fps=27.90  realesrgan_lite  35%  sk=1
+
+non-OOM errors (first 10):
+  flash_grid_s2_pr15%_sk4_sa1: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr15%_sk4_sa0: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr20%_sk4_sa1: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr20%_sk4_sa0: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr25%_sk4_sa1: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr25%_sk4_sa0: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr30%_sk1_sa1: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr30%_sk1_sa0: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr30%_sk2_sa1: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
+  flash_grid_s2_pr30%_sk2_sa0: [infer] loading model: flashvsr_tiny (quant=none dtype=bf16) | [infer] RIFE loaded | [infer] 1 video(s) queued | [infer]
