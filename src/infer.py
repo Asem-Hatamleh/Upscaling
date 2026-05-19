@@ -365,6 +365,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as e:
             print(f"[infer] FAILED on {vp}: {e}", file=sys.stderr)
+            if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+                print("[infer] HINT: lower --pre-resize (e.g. 160x128), enable "
+                      "--sage-attn, set --quant int8_woq, or "
+                      "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+                      file=sys.stderr)
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             continue
         print(f"      wall={res.wall_time_s:.2f}s  src={res.n_source}  sr={res.n_sr}  "
               f"e2e_fps={res.e2e_fps:.2f}  -> {res.out_dir}")

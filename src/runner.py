@@ -90,11 +90,12 @@ def process_video(
     anchor_idx = np.arange(0, len(lr), skip)
     anchors_lr = lr[anchor_idx]
 
-    # 4) SR forward (delegated to model)
+    # 4) SR forward (delegated to model). Defer out_dir creation until after the
+    #    SR step so OOM/error paths don't leave empty folders littering output/.
     out_dir = derive_out_dir(out_root, model_id, video_path, opts, lr_w, lr_h, quant, sage)
-    out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     sr_anchors = upscaler.upscale(anchors_lr)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # 5) downscale SR to requested out_scale if model native_scale > requested
     nat = upscaler.native_scale
