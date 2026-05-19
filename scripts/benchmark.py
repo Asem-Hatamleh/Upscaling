@@ -65,12 +65,14 @@ class RunCfg:
     esrgan_variant: str = "realesr-general-x4v3"
     esrgan_denoise: float = 0.5
     crf: int = 18
+    video_path: str = ""               # filled in by the harness per-video
 
     def to_argv(self, output_root: Path) -> list[str]:
+        in_path = self.video_path or str(INPUT_VIDEO)
         argv = [
             sys.executable, "-m", "src.infer",
             "--model", self.model,
-            "--input", str(INPUT_VIDEO),
+            "--input", in_path,
             "--output", str(output_root),
             "--seconds", str(SECONDS),
             "--scale", str(self.scale),
@@ -179,6 +181,42 @@ def gen_realesrgan_runs() -> list[RunCfg]:
             continue
         runs.append(_with(BASE_REAL, label=f"real_ofat_crf{crf}", crf=crf))
 
+    return runs
+
+
+BASE_GFPGAN = RunCfg(
+    label="gfpgan_base", model="realesrgan_gfpgan",
+    scale=4, pre_resize="50%", frame_skip=2, frame_interp="rife",
+    sage_attn=False, quant="none", dtype="fp16", crf=18,
+)
+
+
+def gen_gfpgan_runs() -> list[RunCfg]:
+    """Smaller targeted grid — the Compact+GFPGAN stack is slower per cell
+    (each frame goes through detector + face-restore + bg-upsampler), so a
+    211-style Cartesian is overkill. We sweep only the knobs that matter
+    for the dev/A100 hand-off:
+      - pre-resize: how aggressively we shrink before SR
+      - frame-skip + interp: the throughput lever
+      - scale: 2 vs 4 (just post-downscale at the writer)
+      - dtype: fp16 vs fp32 (Compact half=True path vs full precision)
+    Total: 2 scales × 3 pre-resizes × 3 skip values × 2 dtypes = 36 cells
+    per video. With 3 videos that's ~108 runs — manageable in ~30 min on
+    8 GB once weights are warm.
+    """
+    runs: list[RunCfg] = []
+    scales = [4, 2]
+    pre = ["35%", "50%", "none"]
+    skips = [1, 2, 4]
+    dtypes = ["fp16", "fp32"]
+    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
+        # skip 1 makes frame-interp irrelevant; force "none" for cleanliness
+        fi = "none" if sk == 1 else "rife"
+        runs.append(_with(BASE_GFPGAN,
+            label=f"gfpgan_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
+            scale=sc, pre_resize=pr, frame_skip=sk,
+            frame_interp=fi, dtype=dt,
+        ))
     return runs
 
 
@@ -428,6 +466,11 @@ def main() -> int:
                     help="per-run subprocess timeout (s)")
     ap.add_argument("--models", default="flashvsr_tiny,realesrgan_lite",
                     help="comma-sep subset to benchmark")
+    ap.add_argument("--videos", default=None,
+                    help="comma-sep list of video paths to run the grid against; "
+                         "defaults to a single video (Real Test Video/1.mp4). "
+                         "Paths are looked up relative to the project root, and "
+                         "also under 'Real Test Video/' if a bare filename is given.")
     ap.add_argument("--limit", type=int, default=0,
                     help="cap total runs (0 = no cap, useful for smoke)")
     ap.add_argument("--dry-run", action="store_true",
@@ -437,9 +480,30 @@ def main() -> int:
                          "and append remaining runs to the same directory")
     args = ap.parse_args()
 
-    if not INPUT_VIDEO.exists():
-        print(f"input video not found: {INPUT_VIDEO}", file=sys.stderr)
-        return 1
+    # Resolve the input videos.
+    videos: list[Path] = []
+    if args.videos:
+        for raw in args.videos.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                if (ROOT / raw).exists():
+                    p = ROOT / raw
+                elif (ROOT / "Real Test Video" / raw).exists():
+                    p = ROOT / "Real Test Video" / raw
+                else:
+                    p = ROOT / raw
+            if not p.exists():
+                print(f"video not found: {raw}", file=sys.stderr)
+                return 1
+            videos.append(p)
+    else:
+        if not INPUT_VIDEO.exists():
+            print(f"input video not found: {INPUT_VIDEO}", file=sys.stderr)
+            return 1
+        videos.append(INPUT_VIDEO)
 
     done_labels: set[str] = set()
     if args.resume:
@@ -464,18 +528,31 @@ def main() -> int:
     summary_path = out_root / "summary.txt"
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
-    runs: list[RunCfg] = []
+    base_runs: list[RunCfg] = []
     if "flashvsr_tiny" in models:
-        runs.extend(gen_flashvsr_runs())
+        base_runs.extend(gen_flashvsr_runs())
     if "realesrgan_lite" in models:
-        runs.extend(gen_realesrgan_runs())
+        base_runs.extend(gen_realesrgan_runs())
+    if "realesrgan_gfpgan" in models:
+        base_runs.extend(gen_gfpgan_runs())
+
+    # Cross every config with every input video. Tag the label so resume + CSV
+    # rows stay unique.
+    runs: list[RunCfg] = []
+    for cfg in base_runs:
+        for vp in videos:
+            stem = vp.stem
+            runs.append(_with(cfg,
+                label=f"{cfg.label}__v{stem}",
+                video_path=str(vp),
+            ))
 
     if done_labels:
         runs = [r for r in runs if r.label not in done_labels]
     if args.limit > 0:
         runs = runs[: args.limit]
 
-    print(f"[bench] {len(runs)} runs queued. out={out_root}")
+    print(f"[bench] {len(runs)} runs queued over {len(videos)} video(s). out={out_root}")
 
     if args.dry_run:
         for i, r in enumerate(runs):

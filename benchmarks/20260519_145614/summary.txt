@@ -1,0 +1,20 @@
+runs: 108  ok: 108  oom: 0  error: 0
+
+top 10 by e2e_fps:
+   19.57 fps  vram= 1312 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_gfpgan/4_sec3_scale2x_224x126_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   19.47 fps  vram= 1317 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_gfpgan/4_sec3_scale2x_224x126_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   15.64 fps  vram= 1314 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_gfpgan/1_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   15.57 fps  vram= 1314 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_gfpgan/2_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   15.34 fps  vram= 1321 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_gfpgan/2_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   15.33 fps  vram= 1321 MB  realesrgan_gfpgan  scale=2 pr=35%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_gfpgan/1_sec3_scale2x_246x202_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   14.90 fps  vram= 1315 MB  realesrgan_gfpgan  scale=2 pr=50%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_gfpgan/4_sec3_scale2x_320x180_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   14.79 fps  vram= 1312 MB  realesrgan_gfpgan  scale=4 pr=35%   sk=4 sage=False quant=none     dt=fp16  -> output/realesrgan_gfpgan/4_sec3_scale4x_224x126_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   14.70 fps  vram= 1317 MB  realesrgan_gfpgan  scale=4 pr=35%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_gfpgan/4_sec3_scale4x_224x126_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+   14.43 fps  vram= 1323 MB  realesrgan_gfpgan  scale=2 pr=50%   sk=4 sage=False quant=none     dt=fp32  -> output/realesrgan_gfpgan/4_sec3_scale2x_320x180_skip4_interp-rife_q-none_sage-off/upscaled.mp4
+
+smallest VRAM among ok runs:
+  vram= 1271 MB  fps=6.17  realesrgan_gfpgan  35%  sk=1
+  vram= 1271 MB  fps=5.92  realesrgan_gfpgan  35%  sk=1
+  vram= 1273 MB  fps=5.06  realesrgan_gfpgan  35%  sk=1
+  vram= 1273 MB  fps=5.12  realesrgan_gfpgan  35%  sk=1
+  vram= 1273 MB  fps=4.82  realesrgan_gfpgan  35%  sk=1

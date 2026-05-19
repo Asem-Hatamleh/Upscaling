@@ -147,44 +147,86 @@ def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return np.concatenate([left, right], axis=2)
 
 
-class VideoWriter:
-    """Lazy mp4 writer using imageio/pyav (libx264 yuv420p)."""
+def _x264_options(crf: int, preset: str = "medium") -> dict[str, str]:
+    """libx264 options. We tag colorspace explicitly because outputs without
+    these tags get rendered with the wrong color matrix by players, which
+    looks like a regular pattern of red/orange/green dots on faces and
+    high-detail regions.
+    """
+    return {
+        "crf": str(int(crf)),
+        "preset": preset,
+        # color metadata — bt709 is the right match for upscaled HD output.
+        "colorprim": "bt709",
+        "transfer": "bt709",
+        "colormatrix": "bt709",
+        # broadcast range (tv), not full (pc). Source 1.mp4 uses tv range.
+        "x264-params": "colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=off",
+    }
 
-    def __init__(self, path: str | os.PathLike, fps: float, crf: int = 18) -> None:
+
+class VideoWriter:
+    """Lazy mp4 writer using PyAV (libx264). Tags colorspace bt709 so players
+    don't misrender chroma as colored-dot artifacts."""
+
+    def __init__(self, path: str | os.PathLike, fps: float, crf: int = 18,
+                 pixel_format: str = "yuv420p") -> None:
         self.path = str(path)
         self.fps = float(fps)
         self.crf = int(crf)
-        self._writer = None
+        self.pixel_format = pixel_format
+        self._container = None
+        self._stream = None
+        self._even_h = self._even_w = 0
 
     def _open(self, h: int, w: int) -> None:
-        # pad to even dims for yuv420p
+        import av  # PyAV
+
+        # libx264 + yuv420p requires both dims even; yuv444p does not but we
+        # round anyway for safety.
         self._even_h = h - (h % 2)
         self._even_w = w - (w % 2)
-        self._writer = iio.imopen(self.path, "w", plugin="pyav")
-        self._writer.init_video_stream(
-            "libx264",
-            fps=self.fps,
-            pixel_format="yuv420p",
-        )
+        self._container = av.open(self.path, mode="w")
+        self._stream = self._container.add_stream("libx264", rate=int(round(self.fps)))
+        self._stream.width = self._even_w
+        self._stream.height = self._even_h
+        self._stream.pix_fmt = self.pixel_format
+        self._stream.options = _x264_options(self.crf)
+        # Tag the bitstream colorspace, not only the encoder, so MP4 stream
+        # metadata carries it through.
         try:
-            self._writer.container_metadata = {"comment": "UpScaling"}
+            self._stream.codec_context.color_range = "tv"
+            self._stream.codec_context.color_primaries = "bt709"
+            self._stream.codec_context.color_trc = "bt709"
+            self._stream.codec_context.colorspace = "bt709"
         except Exception:
             pass
 
     def append(self, frames: np.ndarray) -> None:
+        import av
+
         if frames.ndim == 3:
             frames = frames[None, ...]
-        if self._writer is None:
+        if self._container is None:
             self._open(frames.shape[1], frames.shape[2])
         if frames.shape[1] != self._even_h or frames.shape[2] != self._even_w:
             frames = frames[:, : self._even_h, : self._even_w, :]
         for f in frames:
-            self._writer.write_frame(np.ascontiguousarray(f))
+            av_frame = av.VideoFrame.from_ndarray(
+                np.ascontiguousarray(f), format="rgb24"
+            )
+            for packet in self._stream.encode(av_frame):
+                self._container.mux(packet)
 
     def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+        if self._container is None:
+            return
+        # Flush.
+        for packet in self._stream.encode():
+            self._container.mux(packet)
+        self._container.close()
+        self._container = None
+        self._stream = None
 
     def __enter__(self):
         return self
@@ -193,13 +235,9 @@ class VideoWriter:
         self.close()
 
 
-def encode_video(path: str | os.PathLike, frames: np.ndarray, fps: float, crf: int = 18) -> None:
-    """One-shot writer for small arrays (used for side-by-side)."""
-    h, w = frames.shape[1:3]
-    h2, w2 = h - (h % 2), w - (w % 2)
-    if (h2, w2) != (h, w):
-        frames = frames[:, :h2, :w2, :]
-    with iio.imopen(str(path), "w", plugin="pyav") as f:
-        f.init_video_stream("libx264", fps=float(fps), pixel_format="yuv420p")
-        for fr in frames:
-            f.write_frame(np.ascontiguousarray(fr))
+def encode_video(path: str | os.PathLike, frames: np.ndarray, fps: float,
+                 crf: int = 18, pixel_format: str = "yuv420p") -> None:
+    """One-shot writer. Tags bt709 colorspace to avoid the colored-dot
+    artifact that uncolor-tagged x264 mp4 files show in some players."""
+    with VideoWriter(path, fps=fps, crf=crf, pixel_format=pixel_format) as w:
+        w.append(frames)
