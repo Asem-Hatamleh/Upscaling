@@ -93,8 +93,21 @@ def process_video(
     # 4) SR forward (delegated to model). Defer out_dir creation until after the
     #    SR step so OOM/error paths don't leave empty folders littering output/.
     out_dir = derive_out_dir(out_root, model_id, video_path, opts, lr_w, lr_h, quant, sage)
+    peak_vram_mb = 0
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            _t.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
     t0 = time.perf_counter()
     sr_anchors = upscaler.upscale(anchors_lr)
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            peak_vram_mb = int(_t.cuda.max_memory_allocated() / (1024 * 1024))
+    except Exception:
+        pass
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 5) downscale SR to requested out_scale if model native_scale > requested
@@ -150,6 +163,7 @@ def process_video(
             "sr_frames": int(len(sr_anchors)),
             "wall_time_s": f"{wall:.2f}",
             "e2e_fps": f"{fps_e2e:.2f}",
+            "peak_vram_mb": peak_vram_mb,
             "src_fps": f"{fps:.2f}",
         },
     )

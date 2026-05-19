@@ -378,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
             continue
         print(f"      wall={res.wall_time_s:.2f}s  src={res.n_source}  sr={res.n_sr}  "
               f"e2e_fps={res.e2e_fps:.2f}  -> {res.out_dir}")
+        try:
+            import torch
+            peak = int(torch.cuda.max_memory_allocated() / (1024 * 1024)) if torch.cuda.is_available() else 0
+            print(f"[infer] peak_vram_mb={peak}")
+        except Exception:
+            pass
         total_src += res.n_source
         total_sr += res.n_sr
 
