@@ -188,18 +188,50 @@ UpScaling/
 └── Real Test Video/          # checked-in test clips
 ```
 
-## 9. Troubleshooting
+## 9. Validated smoke-test configs (RTX 5050, 8 GB)
+
+| Model | Pre-resize | Skip | Interp | SageAttn | Quant | e2e FPS | SR dims |
+|-------|-----------|------|--------|----------|-------|--------:|---------|
+| `realesrgan_lite` | `qvga` (293×240 fit) | 1 | none | – | none | **23.5** | 1172×960 |
+| `flashvsr_tiny` | `160x128` | 1 | none | on | none | 8.25 | 640×512 |
+| `flashvsr_tiny` | `160x128` | 2 | repeat | on | none | **14.4** | 640×512 |
+| `flashvsr_tiny` | `160x128` | 2 | rife | on | none | 12.6 | 640×512 |
+
+Notes:
+- FlashVSR Tiny is fixed 4× and the spatial input must be a multiple of 128
+  *after* the 4× upscale, so the smallest practical LR on this GPU is
+  ~160×128 → 640×512 SR. Larger inputs OOM the 8 GB VRAM under dense
+  attention. Production A100 will lift this dramatically.
+- FlashVSR Tiny processes frames in groups of `8n+1`, so a 50-frame clip
+  yields 49 input frames → 45 produced SR frames; we crop to the original
+  count.
+- Block-Sparse-Attention is *not* installed (kernel needs full CUDA toolkit
+  + nvcc; pip wheel only ships ptxas). Our patched `wan_video_dit.py`
+  falls through to dense SDPA — slower but correct.
+
+## 10. Troubleshooting
 
 - **`CUDA error: no kernel image is available for execution`** — wrong torch
   for your GPU. Re-run `setup_linux.sh` so it picks the cu128 nightly for
   Blackwell.
+- **`Disk quota exceeded` during pip install** — `/tmp` is tmpfs (~7 GB on
+  this machine). `setup_linux.sh` exports `TMPDIR=$ROOT/.build_tmp` to side-step it.
 - **`sageattention not available`** — `--sage-attn` is best-effort; the run
   continues with torch SDPA.
 - **`block_sparse_attn` missing** — FlashVSR falls back to dense attention;
   ~1.5–2× slower but still correct.
-- **OOM** — lower `--chunk-frames`, set `--pre-resize qvga`, use `--quant int8_woq`.
+- **OOM** — lower `--pre-resize` (try `160x128` or smaller), set
+  `--quant int8_woq`, set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 - **Choppy output with high `--frame-skip`** — switch `--frame-interp` from
   `repeat` to `rife`.
+- **`basicsr` import fails on `torchvision.transforms.functional_tensor`** —
+  `setup_linux.sh` sed-patches the upstream import; if you bypassed setup,
+  run that patch by hand.
+- **`PretrainedConfig` import error from FlashVSR's diffsynth** — pin
+  `transformers==4.46.2` (handled in `requirements.txt`).
+- **`No module named 'RIFE_HDv3'`** — RIFE v6 weights need the ECCV2022-RIFE
+  Python source. `setup_linux.sh` clones it and installs files into
+  `RIFE_trained_v6/model/`.
 
 ## 10. License
 

@@ -133,8 +133,13 @@ def main(argv: list[str] | None = None) -> int:
     rife = None
     if args.frame_interp == "rife":
         from . import rife_interp
-        rife = rife_interp.RifeInterpolator(args.rife_weights, device=args.device).load()
-        print("[infer] RIFE loaded")
+        try:
+            rife = rife_interp.RifeInterpolator(args.rife_weights, device=args.device).load()
+            print("[infer] RIFE loaded")
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"[infer] RIFE unavailable ({e}); falling back to --frame-interp repeat.",
+                  file=sys.stderr)
+            args.frame_interp = "repeat"
 
     opts = RunOptions(
         seconds=args.seconds,

@@ -11,7 +11,7 @@ torchvision
 numpy<3
 einops>=0.7
 safetensors>=0.4
-huggingface_hub>=0.24
+huggingface_hub>=0.24,<2
 imageio>=2.34
 imageio-ffmpeg>=0.4.9
 av>=12.0           # PyAV: imageio backend
@@ -19,14 +19,23 @@ Pillow>=10
 opencv-python>=4.9
 tqdm>=4.66
 PyYAML>=6.0
+modelscope>=1.20   # FlashVSR's diffsynth fork imports this lazily
 
 # --- FlashVSR backbone (DiffSynth-Studio + sparse attn) ---
 # DiffSynth fork is bundled inside the cloned FlashVSR repo (third_party/FlashVSR/diffsynth).
 # Block-Sparse-Attention has to be built from source on the target machine — see setup_linux.sh.
+# transformers is pinned at the version FlashVSR's diffsynth fork was developed against;
+# newer versions (5.x) moved `PretrainedConfig`, breaking stepvideo_text_encoder import.
 diffusers>=0.30
-transformers>=4.44
-accelerate>=0.33
+transformers==4.46.2
+accelerate>=0.33,<2
 sentencepiece
+peft>=0.10
+ftfy>=6.0
+torchsde>=0.2
+torchmetrics>=1.0
+pytorch-lightning>=2.0
+pandas>=2.0
 
 # --- Real-ESRGAN alt model ---
 realesrgan>=0.3.0

@@ -6,41 +6,70 @@ and **suggested next steps**.
 
 ---
 
-## 1. Where things stand (2026-05-19)
+## 1. Where things stand (2026-05-19, end of session)
 
-### Done
+### Done & validated end-to-end on the laptop (RTX 5050, 8 GB)
 
-- Project scaffold (`src/`, `scripts/`, `configs/`, `third_party/` placeholder).
-- CLI (`src/infer.py`) supports both single-video and folder input.
-- Model registry pattern in `src/models/base.py`; models register themselves on
-  import.
-- Two backends wired:
-  - **`flashvsr_tiny`** — official FlashVSR-v1.1 Tiny via `FlashVSRTinyPipeline`.
-  - **`realesrgan_lite`** — `realesr-general-x4v3` SRVGGNetCompact via RealESRGAN.
-- Performance modules: `sage_patch.py` (SageAttention SDPA monkey-patch),
-  `rife_interp.py` (RIFE-HDv3 wrapper using checked-in v6 weights),
-  `frame_skip.py` (gap fill: `repeat` / `rife`).
-- I/O via PyAV through imageio (no ffmpeg shell-out per video).
-- Side-by-side composition keeps the **full-resolution** source on the left.
-- `run_info.txt` writer matches the original benchmark format.
-- `setup_linux.sh` chooses PyTorch wheel based on detected GPU (Blackwell -> cu128
-  nightly; A100 -> cu121 stable), then builds Block-Sparse-Attention and
-  SageAttention from source.
-- `scripts/download_weights.py` clones FlashVSR repo + pulls v1.1 safetensors +
-  Real-ESRGAN weights.
+- venv + Python 3.11.15 + torch 2.12.0.dev cu128 + sageattention 1.0.6 + bitsandbytes 0.49.2.
+- `realesrgan_lite` smoke test: 2 s of 1.mp4 → **23.5 FPS** e2e at 1172×960 SR.
+- `flashvsr_tiny` smoke tests at 160×128 LR → 640×512 SR:
+  - skip 1, interp none: **8.25 FPS**.
+  - skip 2, interp repeat: **14.4 FPS**.
+  - skip 2, interp rife: **12.6 FPS** (visibly smoother).
+- All three outputs (upscaled.mp4 / comparison.mp4 / run_info.txt) land in
+  the deterministic `output/<model>/<stem>_<args>/` folder.
 
-### Not yet done / not yet validated
+### Discovered & fixed during this session
 
-- Nothing has been run end-to-end on the laptop. PyTorch is not installed yet —
-  `setup_linux.sh` was authored but not executed. Run it first.
-- `flashvsr_tiny.py` assumes the upstream `diffsynth.FlashVSRTinyPipeline` API
-  matches the v1.1 inference script. If upstream renames a kwarg
-  (`topk_ratio`, `kv_ratio`, `local_range`, `color_fix`), patch it in the
-  `pipe(...)` call inside `FlashVSRTiny.upscale`.
-- `nf4` quantization branch is *not implemented* — only `int8_woq` is. Treat
-  `--quant nf4` as a known TODO; current code will simply not quantize.
-- Block-Sparse-Attention build can fail on Blackwell because some kernels need
-  patches for sm_120. If the build fails, `--sage-attn` is the next-best lever.
+1. **`/tmp` is tmpfs ~7 GB** on this laptop; pip build isolation blew through
+   it pulling torch+CUDA. Fix: `setup_linux.sh` now sets
+   `TMPDIR="$ROOT/.build_tmp"` on the 396 GB root partition.
+2. **`basicsr` imports a removed torchvision API** (`functional_tensor`).
+   `setup_linux.sh` sed-patches `degradations.py` post-install.
+3. **`encode_video` passed `pixel_format=` to `iio.imwrite`** — newer PyAV
+   plugin rejects it. Switched to `imopen` + `init_video_stream` pattern.
+4. **FlashVSR's diffsynth fork hard-imports `block_sparse_attn`**. The
+   kernel needs full nvcc; pip wheel `nvidia-cuda-nvcc-cu12` only ships
+   ptxas, not the driver. `setup_linux.sh` patches the import to be
+   optional and adds a dense-SDPA fallback in `flash_attention()`. Slower
+   but correct; SageAttention SDPA patch claws back ~1.3× of the loss.
+5. **Old FlashVSR wrapper was wrong.** Real upstream contract:
+   - LQ tensor must be in `[-1, 1]`, not `[0, 1]`.
+   - Spatial multiple is **128**, not 16.
+   - LQ is bicubic-upsampled to the SR target dims *before* the pipeline
+     call (the pipeline refines, doesn't upscale).
+   - Frame count must be `8n+1`; pad with last frame ×4 then crop output.
+   - `topk_ratio = sparse_ratio * 768 * 1280 / (tH * tW)`.
+   - Init sequence is `mm.load_models([diffusion.safetensors])`,
+     `FlashVSRTinyPipeline.from_model_manager`, manual
+     `pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(...)`,
+     manual `pipe.TCDecoder = build_tcdecoder(...)`, then
+     `enable_vram_management`, `init_cross_kv(context_tensor=...)`,
+     `load_models_to_device(["dit","vae"])`. (No VAE checkpoint loaded
+     for the Tiny variant — `mm.fetch_model("wan_video_vae")` returns
+     None and TCDecoder takes over.)
+6. **`transformers==4.46.2` pin.** Newer `transformers` (5.x) moved
+   `PretrainedConfig`, breaking FlashVSR's `stepvideo_text_encoder` import.
+7. **RIFE-HDv3 source was missing.** Only v6 `flownet.pkl` was checked in;
+   the Python source comes from the ECCV2022-RIFE repo. `setup_linux.sh`
+   clones it and copies `model/{IFNet,RIFE,refine,warplayer,IFNet_m,laplacian}.py`
+   into `RIFE_trained_v6/model/`, with a `loss.py` stub so `Model()` can
+   construct without the training stack.
+
+### Still open / known unknowns
+
+- **`nf4` quantization is a stub.** Only `int8_woq` (bitsandbytes Linear8bitLt)
+  is wired up. `--quant nf4` is silently ignored.
+- **Block-Sparse-Attention not built.** Would need `apt install nvidia-cuda-toolkit`
+  (or the NVIDIA run-file) for nvcc. On A100 this is trivial; on the laptop
+  it's not. SageAttention covers most of the perf gap.
+- **VAE not loaded** for FlashVSR Tiny. The upstream Tiny script also omits
+  it; TCDecoder handles the decode. If you ever call `pipe.encode_video()` /
+  `pipe.decode_video()` directly, load Wan2.1_VAE.pth into the ModelManager
+  too.
+- **A100 path not yet exercised.** The wrapper hard-codes 128-multiple and
+  the 8n+1 padding; both are FlashVSR-Tiny constraints and should carry
+  over. Expect a big jump (~17 FPS at 768×1408 per the upstream README).
 
 ---
 

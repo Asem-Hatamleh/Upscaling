@@ -189,7 +189,7 @@ def encode_video(path: str | os.PathLike, frames: np.ndarray, fps: float, crf: i
     h2, w2 = h - (h % 2), w - (w % 2)
     if (h2, w2) != (h, w):
         frames = frames[:, :h2, :w2, :]
-    iio.imwrite(
-        str(path), frames, plugin="pyav", codec="libx264",
-        fps=fps, pixel_format="yuv420p",
-    )
+    with iio.imopen(str(path), "w", plugin="pyav") as f:
+        f.init_video_stream("libx264", fps=float(fps), pixel_format="yuv420p")
+        for fr in frames:
+            f.write_frame(np.ascontiguousarray(fr))

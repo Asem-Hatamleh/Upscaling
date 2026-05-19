@@ -27,8 +27,14 @@ def _ensure_rife_on_path(weights_dir: str | os.PathLike) -> Path:
             f"RIFE weights not found at {train_log}/flownet.pkl. "
             "Pass --rife-weights /path/to/RIFE_trained_v6 or download v6."
         )
-    if str(train_log) not in sys.path:
-        sys.path.insert(0, str(train_log))
+    if not (p / "model" / "RIFE.py").exists():
+        raise FileNotFoundError(
+            f"RIFE source files missing under {p}/model/. Expected ECCV2022-RIFE "
+            "layout: model/{IFNet.py,RIFE.py,refine.py,warplayer.py,...} alongside "
+            "train_log/flownet.pkl."
+        )
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
     return train_log
 
 
@@ -51,10 +57,10 @@ class RifeInterpolator:
     def load(self) -> "RifeInterpolator":
         train_log = _ensure_rife_on_path(self.weights_dir)
         try:
-            from RIFE_HDv3 import Model  # type: ignore
+            from model.RIFE import Model  # type: ignore
         except Exception as e:  # pragma: no cover
             raise RuntimeError(
-                f"failed to import RIFE_HDv3 from {train_log}: {e}"
+                f"failed to import RIFE Model from {self.weights_dir}/model/: {e}"
             ) from e
         m = Model()
         m.load_model(str(train_log), -1)
