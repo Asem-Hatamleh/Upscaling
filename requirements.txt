@@ -1,0 +1,44 @@
+# --- Core ML ---
+# Install PyTorch matching your CUDA from https://pytorch.org first.
+# Example (dev, RTX 5050 / sm_120 / CUDA 13.x):
+#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+# Example (prod, A100 / CUDA 12.x):
+#   pip install torch==2.4.* torchvision==0.19.* --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+
+# --- Pipeline deps ---
+numpy<3
+einops>=0.7
+safetensors>=0.4
+huggingface_hub>=0.24
+imageio>=2.34
+imageio-ffmpeg>=0.4.9
+av>=12.0           # PyAV: imageio backend
+Pillow>=10
+opencv-python>=4.9
+tqdm>=4.66
+PyYAML>=6.0
+
+# --- FlashVSR backbone (DiffSynth-Studio + sparse attn) ---
+# DiffSynth fork is bundled inside the cloned FlashVSR repo (third_party/FlashVSR/diffsynth).
+# Block-Sparse-Attention has to be built from source on the target machine — see setup_linux.sh.
+diffusers>=0.30
+transformers>=4.44
+accelerate>=0.33
+sentencepiece
+
+# --- Real-ESRGAN alt model ---
+realesrgan>=0.3.0
+basicsr>=1.4.2
+gfpgan>=1.3.8
+
+# --- Optional perf ---
+# SageAttention (Linux only) — install from source for your CUDA:
+#   pip install sageattention
+# bitsandbytes int8 weight-only quant:
+bitsandbytes>=0.43; platform_system == "Linux"
+sageattention; platform_system == "Linux"
+
+# --- Dev ---
+pytest>=8

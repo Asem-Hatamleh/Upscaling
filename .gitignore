@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv
+venv/
+.venv/
+env/
+
+# Cloned third-party repos (FlashVSR, Block-Sparse-Attention, etc.)
+third_party/FlashVSR/
+third_party/Block-Sparse-Attention/
+third_party/SageAttention/
+
+# Weights
+weights/
+*.pth
+*.ckpt
+*.safetensors
+!RIFE_trained_v6/**/*.pkl
+
+# Generated output
+output/
+
+# macOS / IDE cruft
+__MACOSX/
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+nohup.out
