@@ -186,7 +186,7 @@ def run_wizard(args: argparse.Namespace) -> None:
     args.scale = _ask("output scale", args.scale, choices=["2", "4"], cast=int)
 
     # 6. Pre-resize
-    print("  pre-resize choices: none | vga | qvga | WxH (e.g. 160x128) | pct:NN")
+    print("  pre-resize choices: none | vga | qvga | WxH (e.g. 160x128) | NN% (e.g. 30%)")
     args.pre_resize = _ask("pre-resize", args.pre_resize)
 
     # 7. Frame skip

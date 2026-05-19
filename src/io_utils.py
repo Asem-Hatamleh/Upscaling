@@ -91,9 +91,9 @@ def resolve_preprocess(src_w: int, src_h: int, opt: str) -> Tuple[int, int]:
         ``vga``                  -> 640x480 (keep aspect, fit)
         ``qvga``                 -> 320x240 (fit)
         ``WxH``                  -> exact target, e.g. ``256x192``
-        ``pct:NN``               -> percentage of source, e.g. ``pct:50``
+        ``pct:NN`` / ``NN%``     -> percentage of source, e.g. ``50%``
     """
-    opt = (opt or "none").lower()
+    opt = (opt or "none").strip().lower()
     if opt == "none":
         return src_w, src_h
     if opt == "vga":
@@ -102,11 +102,21 @@ def resolve_preprocess(src_w: int, src_h: int, opt: str) -> Tuple[int, int]:
         return _fit(src_w, src_h, 320, 240)
     if opt.startswith("pct:"):
         pct = float(opt.split(":", 1)[1]) / 100.0
-        return max(2, int(round(src_w * pct))), max(2, int(round(src_h * pct)))
+        return _scale_pct(src_w, src_h, pct)
+    if opt.endswith("%"):
+        pct = float(opt[:-1]) / 100.0
+        return _scale_pct(src_w, src_h, pct)
     if "x" in opt:
         a, b = opt.split("x", 1)
         return int(a), int(b)
-    raise ValueError(f"unknown resize spec: {opt}")
+    raise ValueError(f"unknown resize spec: {opt!r} (try 'none', 'vga', 'qvga', "
+                     f"'WxH' like '160x128', or 'NN%' like '30%')")
+
+
+def _scale_pct(src_w: int, src_h: int, pct: float) -> Tuple[int, int]:
+    if pct <= 0:
+        raise ValueError(f"pct must be > 0, got {pct}")
+    return max(2, int(round(src_w * pct))), max(2, int(round(src_h * pct)))
 
 
 def _fit(src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> Tuple[int, int]:
