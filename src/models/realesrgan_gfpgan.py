@@ -49,6 +49,7 @@ def _ensure_gfpgan_weight() -> Path:
     return out
 
 
+@register("realesrgan_lite_gfpgan")
 @register("realesrgan_gfpgan")
 class RealESRGANGFPGAN(BaseUpscaler):
     """Compact background upsampler + GFPGAN face restoration."""

@@ -51,6 +51,8 @@ def _ensure_repo_on_path() -> None:
     return None
 
 
+@register("realesrgan_lite_codeformer")
+@register("realesrgan_codeformer")
 @register("codeformer_compact")
 class CodeFormerCompact(BaseUpscaler):
     native_scale = 4

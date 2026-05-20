@@ -46,9 +46,11 @@ def reclassify(rows):
 
 
 def fmt_row(r):
-    return (f"  {_f(r['e2e_fps']):6.2f} fps  vram={_i(r['peak_vram_mb']):>5} MB  "
+    latency = _f(r.get("latency_ms_per_source_frame", 0))
+    return (f"  {_f(r['e2e_fps']):6.2f} fps  latency={latency:6.1f} ms  "
+            f"vram={_i(r['peak_vram_mb']):>5} MB  "
             f"{r['model']:<15}  scale={r['scale']} pr={r['pre_resize']:<5} "
-            f"sk={r['frame_skip']} sage={r['sage_attn']:<5} quant={r['quant']:<8} "
+            f"sk={r['frame_skip']} interp={r.get('frame_interp', ''):<6} quant={r['quant']:<8} "
             f"dt={r['dtype']:<4}  out_res={r['out_res']}")
 
 
@@ -79,14 +81,30 @@ def main() -> int:
     lines.append("")
 
     # Top 20 by FPS overall
+    hit10 = [r for r in ok if _f(r["e2e_fps"]) >= 10.0]
+    if hit10:
+        lines.append("## Configs >= 10 FPS\n")
+        lines.append("| FPS | latency ms | VRAM MB | model | scale | pr | skip | interp | dtype | cf | out_res |")
+        lines.append("|---:|---:|---:|---|---:|---|---:|---|---|---:|---|")
+        for r in hit10[:20]:
+            lines.append(
+                f"| **{_f(r['e2e_fps']):.2f}** | {_f(r.get('latency_ms_per_source_frame')):.1f} | "
+                f"{_i(r['peak_vram_mb'])} | {r['model']} | {r['scale']} | {r['pre_resize']} | "
+                f"{r['frame_skip']} | {r.get('frame_interp', '')} | {r['dtype']} | "
+                f"{r.get('cf_fidelity', '')} | {r['out_res']} |"
+            )
+        lines.append("")
+
     lines.append("## Top 20 by end-to-end FPS\n")
-    lines.append("| FPS | VRAM MB | model | scale | pr | skip | sage | quant | dtype | out_res |")
-    lines.append("|---:|---:|---|---:|---|---:|---|---|---|---|")
+    lines.append("| FPS | latency ms | VRAM MB | model | scale | pr | skip | interp | quant | dtype | cf | out_res |")
+    lines.append("|---:|---:|---:|---|---:|---|---:|---|---|---|---:|---|")
     for r in ok[:20]:
         lines.append(
-            f"| **{_f(r['e2e_fps']):.2f}** | {_i(r['peak_vram_mb'])} | "
+            f"| **{_f(r['e2e_fps']):.2f}** | {_f(r.get('latency_ms_per_source_frame')):.1f} | "
+            f"{_i(r['peak_vram_mb'])} | "
             f"{r['model']} | {r['scale']} | {r['pre_resize']} | {r['frame_skip']} | "
-            f"{r['sage_attn']} | {r['quant']} | {r['dtype']} | {r['out_res']} |"
+            f"{r.get('frame_interp', '')} | {r['quant']} | {r['dtype']} | "
+            f"{r.get('cf_fidelity', '')} | {r['out_res']} |"
         )
     lines.append("")
 
@@ -98,13 +116,15 @@ def main() -> int:
     for m, rs in by_model.items():
         rs.sort(key=lambda r: -_f(r["e2e_fps"]))
         lines.append(f"### {m}\n")
-        lines.append("| FPS | VRAM MB | scale | pr | skip | sage | quant | dt | out_res |")
-        lines.append("|---:|---:|---:|---|---:|---|---|---|---|")
+        lines.append("| FPS | latency ms | VRAM MB | scale | pr | skip | interp | quant | dt | cf | out_res |")
+        lines.append("|---:|---:|---:|---:|---|---:|---|---|---|---:|---|")
         for r in rs[:10]:
             lines.append(
-                f"| **{_f(r['e2e_fps']):.2f}** | {_i(r['peak_vram_mb'])} | "
+                f"| **{_f(r['e2e_fps']):.2f}** | {_f(r.get('latency_ms_per_source_frame')):.1f} | "
+                f"{_i(r['peak_vram_mb'])} | "
                 f"{r['scale']} | {r['pre_resize']} | {r['frame_skip']} | "
-                f"{r['sage_attn']} | {r['quant']} | {r['dtype']} | {r['out_res']} |"
+                f"{r.get('frame_interp', '')} | {r['quant']} | {r['dtype']} | "
+                f"{r.get('cf_fidelity', '')} | {r['out_res']} |"
             )
         lines.append("")
 
@@ -129,15 +149,16 @@ def main() -> int:
 
     # OFAT sensitivity (avg FPS per knob value, within each model)
     lines.append("## Per-knob sensitivity (mean FPS over `ok` runs)\n")
-    knobs = ["pre_resize", "frame_skip", "sage_attn", "quant", "dtype",
+    knobs = ["pre_resize", "frame_skip", "frame_interp", "sage_attn", "quant", "dtype",
              "chunk_frames", "topk_ratio", "kv_ratio", "local_range",
-             "color_fix", "crf", "scale"]
+             "color_fix", "esrgan_denoise", "esrgan_tile", "cf_fidelity",
+             "face_detect_all", "eye_dist_threshold", "crf", "scale"]
     for m, rs in by_model.items():
         lines.append(f"### {m}\n")
         for k in knobs:
             agg = defaultdict(list)
             for r in rs:
-                agg[r[k]].append(_f(r["e2e_fps"]))
+                agg[r.get(k, "")].append(_f(r["e2e_fps"]))
             if len(agg) < 2:
                 continue
             lines.append(f"**{k}**")

@@ -359,6 +359,41 @@ def main(argv: list[str] | None = None) -> int:
         chunk_frames=args.chunk_frames,
         rife_weights=args.rife_weights,
         crf=args.crf,
+        run_tag=(
+            f"dt-{args.dtype}_tile-{args.esrgan_tile}_dn-{args.esrgan_denoise:g}_"
+            f"var-{args.esrgan_variant}_cf-{args.cf_fidelity:g}_"
+            f"eye-{args.eye_dist_threshold}_all-{int(args.face_detect_all)}_crf-{args.crf}"
+            if args.model.startswith("realesrgan") or "codeformer" in args.model else
+            f"dt-{args.dtype}_chunk-{args.chunk_frames}_topk-{args.topk_ratio:g}_"
+            f"kv-{args.kv_ratio:g}_local-{args.local_range}_cf-{int(not args.no_color_fix)}_crf-{args.crf}"
+        ),
+        cli_args={
+            "model": args.model,
+            "output": args.output,
+            "scale": args.scale,
+            "pre_resize": args.pre_resize,
+            "frame_skip": args.frame_skip,
+            "frame_interp": args.frame_interp,
+            "rife_weights": args.rife_weights,
+            "sage_attn": args.sage_attn,
+            "quant": args.quant,
+            "dtype": args.dtype,
+            "device": args.device,
+            "chunk_frames": args.chunk_frames,
+            "topk_ratio": args.topk_ratio,
+            "kv_ratio": args.kv_ratio,
+            "local_range": args.local_range,
+            "color_fix": not args.no_color_fix,
+            "esrgan_variant": args.esrgan_variant,
+            "esrgan_denoise": args.esrgan_denoise,
+            "esrgan_tile": args.esrgan_tile,
+            "cf_fidelity": args.cf_fidelity,
+            "face_detect_all": args.face_detect_all,
+            "eye_dist_threshold": args.eye_dist_threshold,
+            "write_comparison": not args.no_comparison,
+            "write_upscaled": not args.no_upscaled,
+            "crf": args.crf,
+        },
     )
 
     videos = collect_videos(args.input)
