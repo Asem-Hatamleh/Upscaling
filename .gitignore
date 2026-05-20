@@ -30,6 +30,9 @@ weights/
 # Generated output
 output/
 
+# Local test videos (kept on disk, not in git)
+Real Test Video/
+
 # macOS / IDE cruft
 __MACOSX/
 .DS_Store
