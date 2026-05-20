@@ -300,7 +300,7 @@ def gen_codeformer_runs() -> list[RunCfg]:
     """
     runs: list[RunCfg] = []
     scales = [4, 2]
-    pre = ["35%", "50%", "none"]
+    pre = ["80%", "85%", "90%", "95%", "none"]
     skips = [1, 2, 4]
     dtypes = ["fp16", "fp32"]
     for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
@@ -309,6 +309,35 @@ def gen_codeformer_runs() -> list[RunCfg]:
             label=f"codeformer_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
             scale=sc, pre_resize=pr, frame_skip=sk,
             frame_interp=fi, dtype=dt,
+        ))
+    return runs
+
+
+def gen_codeformer_temporal_runs() -> list[RunCfg]:
+    """CodeFormer temporal-stability sweep.
+
+    Uses high fidelity and stricter face thresholds to reduce frame-to-frame
+    face/eye jitter.
+    """
+    runs: list[RunCfg] = []
+    scales = [4]
+    pre = ["80%", "85%", "90%", "95%", "none"]
+    fidelities = [1.0]
+    eye_thresholds = [15, 20, 25, 30]
+    for sc, pr, cf, eye in itertools.product(scales, pre, fidelities, eye_thresholds):
+        runs.append(_with(
+            BASE_CODEFORMER,
+            label=f"codeformer_temporal_s{sc}_pr{pr}_cf{cf:g}_eye{eye}_fp16",
+            scale=sc,
+            pre_resize=pr,
+            frame_skip=1,
+            frame_interp="none",
+            dtype="fp16",
+            esrgan_denoise=1.0,
+            esrgan_tile=0,
+            cf_fidelity=cf,
+            face_detect_all=False,
+            eye_dist_threshold=eye,
         ))
     return runs
 
@@ -794,10 +823,13 @@ def main() -> int:
     ap.add_argument("--models", default="flashvsr_tiny,realesrgan_lite",
                     help="comma-sep subset to benchmark")
     ap.add_argument("--preset", default="default",
-                    choices=["default", "esrgan_target10", "face_enhance_best"],
+                    choices=["default", "esrgan_target10", "face_enhance_best",
+                             "codeformer_temporal"],
                     help="named sweep preset; esrgan_target10 tests lite/GFPGAN/"
                          "CodeFormer at none/80%/70% looking for >=10 FPS; "
-                         "face_enhance_best tests current best face-quality args")
+                         "face_enhance_best tests current best face-quality args; "
+                         "codeformer_temporal tests high-fidelity CodeFormer "
+                         "with stricter face-detection thresholds")
     ap.add_argument("--videos", default=None,
                     help="comma-sep list of video paths to run the grid against; "
                          "defaults to a single video (Real Test Video/1.mp4). "
@@ -912,6 +944,8 @@ def main() -> int:
         base_runs.extend(gen_esrgan_target10_runs())
     elif args.preset == "face_enhance_best":
         base_runs.extend(gen_face_enhance_best_runs())
+    elif args.preset == "codeformer_temporal":
+        base_runs.extend(gen_codeformer_temporal_runs())
     else:
         if "flashvsr_tiny" in models:
             base_runs.extend(gen_flashvsr_runs())
