@@ -22,6 +22,16 @@ and **suggested next steps**.
   upscales background 4×, GFPGAN restores 512×512 face crops, paste-back).
   On A100 this is expected to land at 30–60 FPS based on Compact-TRT
   benchmarks and the GFPGAN-1.4 published timings.
+- `codeformer_compact` smoke (alt face restorer): 2 s of 1.mp4 @
+  pre-resize 35 % → **3.63 FPS**, 1.15 GB VRAM. CodeFormer is a 94 M-param
+  model (vs GFPGAN's 76 M) so per-face latency is ~30 % higher, but the
+  codebook prior tends to produce more natural skin and tolerates profile
+  / occluded faces better.
+- `basicvsrpp` smoke (true temporal SR): 2 s of 1.mp4 @ pre-resize 35 % →
+  **8.01 FPS**, 1.27 GB VRAM. Bidirectional flow propagation gives
+  frame-to-frame coherence that the per-frame Compact path lacks; no
+  RIFE post-EMA needed. Model is fp32-only on this build (internal flow
+  ops mismatch fp16 autocast).
 - 211-run automated benchmark sweep recorded under `benchmarks/latest/`:
   top realesrgan_lite **48.5 FPS** @ 175 MB VRAM, top flashvsr_tiny
   **38.2 FPS** @ 4.2 GB. See `benchmarks/latest/REPORT.md`.
@@ -68,6 +78,18 @@ and **suggested next steps**.
 
 ### Still open / known unknowns
 
+- **`basicvsrpp` weights are mmediting-format and remapped on load** —
+  upstream BasicVSR++ release isn't on GitHub; we fetch from openmmlab's
+  CDN and strip the `generator.` prefix + unwrap mmediting's spynet
+  ConvModule indices to basicsr's Sequential layout. If openmmlab moves
+  the CDN, swap the URL in `scripts/download_weights.py`.
+- **`codeformer_compact` vendors two arch files** under
+  ``src/models/_codeformer/`` — copying from upstream CodeFormer was
+  necessary because their bundled `basicsr` conflicts with pip's
+  `basicsr` (which `realesrgan` and `gfpgan` rely on). The vendored
+  files import their own `vqgan_arch` relatively and use pip basicsr's
+  `ARCH_REGISTRY` / `get_root_logger`. Re-vendor if upstream CodeFormer
+  ever ships a meaningful architecture change.
 - **`realesrgan_gfpgan` on RTX 5050 is slow** (1.78 FPS at native input).
   Two bottlenecks: GFPGAN-1.4's RetinaFace-ResNet50 detector (~25 ms/frame)
   and Compact at full 4× output (~150 ms on RTX 5050). On A100, swap

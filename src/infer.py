@@ -79,6 +79,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--esrgan-tile", type=int, default=0,
                    help="Tile size for VRAM-constrained inference (0 = no tile)")
 
+    # Face-restorer knobs (shared by realesrgan_gfpgan + codeformer_compact).
+    p.add_argument("--cf-fidelity", type=float, default=0.9,
+                   help="CodeFormer fidelity weight (0=hallucinate, 1=keep "
+                        "landmarks). 0.9 preserves driver identity; 0.5-0.7 "
+                        "are stylized.")
+    p.add_argument("--face-detect-all", action="store_true",
+                   help="Restore every detected face, not only the largest. "
+                        "Default: only the largest/center face — picks the "
+                        "driver and ignores background reflections.")
+    p.add_argument("--eye-dist-threshold", type=int, default=10,
+                   help="Drop faces whose detected eyes are closer than N "
+                        "source-pixels (filters tiny / hallucinated faces).")
+
     # Output toggles
     p.add_argument("--no-comparison", action="store_true",
                    help="Skip side-by-side comparison output")
@@ -305,6 +318,10 @@ def main(argv: list[str] | None = None) -> int:
         "model_name": args.esrgan_variant,
         "denoise_strength": args.esrgan_denoise,
         "tile": args.esrgan_tile,
+        # face-restorer knobs
+        "codeformer_fidelity": args.cf_fidelity,
+        "only_center_face": not args.face_detect_all,
+        "eye_dist_threshold": args.eye_dist_threshold,
     }
 
     cfg = UpscalerConfig(

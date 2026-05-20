@@ -94,6 +94,39 @@ def download_gfpgan_weights() -> None:
             continue
         print(f"[gfpgan] downloading {url}")
         urllib.request.urlretrieve(url, out)
+
+
+def download_codeformer_weights() -> None:
+    dest = ROOT / "weights" / "codeformer"
+    dest.mkdir(parents=True, exist_ok=True)
+    urls = [
+        ("codeformer.pth",
+         "https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"),
+    ]
+    for name, url in urls:
+        out = dest / name
+        if out.exists():
+            print(f"[codeformer] already have {name}")
+            continue
+        print(f"[codeformer] downloading {url}")
+        urllib.request.urlretrieve(url, out)
+
+
+def download_basicvsrpp_weights() -> None:
+    dest = ROOT / "weights" / "basicvsrpp"
+    dest.mkdir(parents=True, exist_ok=True)
+    urls = [
+        ("basicvsr_plusplus_reds4.pth",
+         "https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/"
+         "basicvsr_plusplus_c64n7_8x1_600k_reds4_20210217-db622b2f.pth"),
+    ]
+    for name, url in urls:
+        out = dest / name
+        if out.exists():
+            print(f"[basicvsrpp] already have {name}")
+            continue
+        print(f"[basicvsrpp] downloading {url}")
+        urllib.request.urlretrieve(url, out)
     # facexlib face-detection weight (RetinaFace ResNet50) — auto-downloads
     # on first use, but pre-fetch so the first inference run isn't slow.
     facexlib_dest = ROOT / "weights" / "facexlib"
@@ -125,7 +158,8 @@ def check_rife() -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model",
-                   choices=["flashvsr", "realesrgan", "gfpgan", "all"],
+                   choices=["flashvsr", "realesrgan", "gfpgan", "codeformer",
+                            "basicvsrpp", "all"],
                    required=True)
     args = p.parse_args()
 
@@ -136,6 +170,10 @@ def main() -> int:
         download_realesrgan_weights()
     if args.model in ("gfpgan", "all"):
         download_gfpgan_weights()
+    if args.model in ("codeformer", "all"):
+        download_codeformer_weights()
+    if args.model in ("basicvsrpp", "all"):
+        download_basicvsrpp_weights()
     check_rife()
     return 0
 

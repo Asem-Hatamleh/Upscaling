@@ -220,6 +220,59 @@ def gen_gfpgan_runs() -> list[RunCfg]:
     return runs
 
 
+BASE_CODEFORMER = RunCfg(
+    label="codeformer_base", model="codeformer_compact",
+    scale=4, pre_resize="50%", frame_skip=2, frame_interp="rife",
+    sage_attn=False, quant="none", dtype="fp16", crf=18,
+)
+
+
+def gen_codeformer_runs() -> list[RunCfg]:
+    """Same shape as the GFPGAN grid so the two face-restore backends are
+    directly A/B-comparable per video.
+    """
+    runs: list[RunCfg] = []
+    scales = [4, 2]
+    pre = ["35%", "50%", "none"]
+    skips = [1, 2, 4]
+    dtypes = ["fp16", "fp32"]
+    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
+        fi = "none" if sk == 1 else "rife"
+        runs.append(_with(BASE_CODEFORMER,
+            label=f"codeformer_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
+            scale=sc, pre_resize=pr, frame_skip=sk,
+            frame_interp=fi, dtype=dt,
+        ))
+    return runs
+
+
+BASE_BVSRPP = RunCfg(
+    label="bvsrpp_base", model="basicvsrpp",
+    scale=4, pre_resize="50%", frame_skip=1, frame_interp="none",
+    sage_attn=False, quant="none", dtype="fp32", crf=18,
+)
+
+
+def gen_basicvsrpp_runs() -> list[RunCfg]:
+    """BasicVSR++ is true temporal SR — frame-skip kneecaps the model's
+    bidirectional flow propagation, so we keep skip ∈ {1, 2} and lean on
+    pre-resize as the main throughput knob.
+    """
+    runs: list[RunCfg] = []
+    scales = [4, 2]
+    pre = ["35%", "50%", "none"]
+    skips = [1, 2]
+    dtypes = ["fp32"]    # arch internals don't autocast cleanly to fp16
+    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
+        fi = "none" if sk == 1 else "rife"
+        runs.append(_with(BASE_BVSRPP,
+            label=f"bvsrpp_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
+            scale=sc, pre_resize=pr, frame_skip=sk,
+            frame_interp=fi, dtype=dt,
+        ))
+    return runs
+
+
 def _with(base: RunCfg, **kwargs) -> RunCfg:
     d = asdict(base)
     d.update(kwargs)
@@ -535,6 +588,10 @@ def main() -> int:
         base_runs.extend(gen_realesrgan_runs())
     if "realesrgan_gfpgan" in models:
         base_runs.extend(gen_gfpgan_runs())
+    if "codeformer_compact" in models:
+        base_runs.extend(gen_codeformer_runs())
+    if "basicvsrpp" in models:
+        base_runs.extend(gen_basicvsrpp_runs())
 
     # Cross every config with every input video. Tag the label so resume + CSV
     # rows stay unique.

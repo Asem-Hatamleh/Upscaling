@@ -18,6 +18,7 @@ third_party/Block-Sparse-Attention/
 third_party/SageAttention/
 third_party/RIFE/
 third_party/Practical-RIFE/
+third_party/CodeFormer/
 
 # Weights
 weights/

@@ -37,14 +37,19 @@ torchmetrics>=1.0
 pytorch-lightning>=2.0
 pandas>=2.0
 
-# --- Real-ESRGAN alt model + GFPGAN face restoration backend ---
-# `realesrgan_gfpgan` stacks Compact (background) + GFPGAN-1.4 (faces) and
-# uses facexlib's RetinaFace detector under the hood. All four pip pkgs are
-# required when running that backend.
+# --- Real-ESRGAN alt + GFPGAN / CodeFormer / BasicVSR++ backends ---
+# `realesrgan_gfpgan` stacks Compact (background) + GFPGAN-1.4 (faces).
+# `codeformer_compact` stacks Compact + CodeFormer-v1 (faces). The
+# CodeFormer arch is vendored into ``src/models/_codeformer/`` and reuses
+# pip basicsr's `ARCH_REGISTRY` / `get_root_logger`. `lpips` is a transitive
+# dep of CodeFormer's perceptual loss module (loaded lazily).
+# `basicvsrpp` uses basicsr's `BasicVSRPlusPlus` arch with mmediting REDS4
+# weights remapped at load time.
 realesrgan>=0.3.0
 basicsr>=1.4.2
 gfpgan>=1.3.8
 facexlib>=0.3.0
+lpips>=0.1.4
 
 # --- Optional perf ---
 # SageAttention (Linux only) — install from source for your CUDA:
