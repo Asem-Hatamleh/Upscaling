@@ -62,10 +62,7 @@ class RealESRGANGFPGAN(BaseUpscaler):
         self.bg_variant = ex.get("model_name", "realesr-general-x4v3")
         self.denoise_strength = float(ex.get("denoise_strength", 0.5))
         self.bg_tile = int(ex.get("tile", 0))
-        # Driver-monitoring: one face per frame; suppress background reflections
-        # in the rear-view mirror / passenger seat that GFPGAN would otherwise
-        # "restore" into eerie low-res face stamps.
-        self.only_center_face = bool(ex.get("only_center_face", True))
+        self.only_center_face = bool(ex.get("only_center_face", False))
         self.detector = str(ex.get("face_detector", "retinaface_resnet50"))
 
     # ------------- lifecycle -------------

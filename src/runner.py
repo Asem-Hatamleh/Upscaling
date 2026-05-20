@@ -25,6 +25,8 @@ class RunOptions:
     rife_weights: Optional[str] = None
     comparison_height: int = 0    # 0 = use SR height
     crf: int = 18
+    run_tag: str = ""
+    cli_args: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -51,6 +53,9 @@ def derive_out_dir(root: Path, model_id: str, video_path: Path,
         f"q-{quant}",
         f"sage-{'on' if sage else 'off'}",
     ]
+    if opts.run_tag:
+        safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in opts.run_tag)
+        parts.append(safe)
     if opts.seconds:
         parts.insert(1, f"sec{int(round(opts.seconds))}")
     return root / model_id / "_".join(parts)
@@ -133,6 +138,8 @@ def process_video(
 
     wall = time.perf_counter() - t0
     fps_e2e = n_src / wall if wall > 0 else 0.0
+    latency_src_ms = (wall / n_src * 1000.0) if n_src else 0.0
+    latency_sr_ms = (wall / len(sr_anchors) * 1000.0) if len(sr_anchors) else 0.0
 
     # 7) write outputs
     up_path = out_dir / "upscaled.mp4" if opts.write_upscaled else None
@@ -150,6 +157,7 @@ def process_video(
         quant=quant,
         sage_attn=sage,
         args={
+            **opts.cli_args,
             "input": str(video_path),
             "duration_s": f"{opts.seconds}  (0 = full video)",
             "out_scale": f"{opts.out_scale}x",
@@ -163,6 +171,8 @@ def process_video(
             "sr_frames": int(len(sr_anchors)),
             "wall_time_s": f"{wall:.2f}",
             "e2e_fps": f"{fps_e2e:.2f}",
+            "latency_ms_per_source_frame": f"{latency_src_ms:.2f}",
+            "latency_ms_per_sr_frame": f"{latency_sr_ms:.2f}",
             "peak_vram_mb": peak_vram_mb,
             "src_fps": f"{fps:.2f}",
         },

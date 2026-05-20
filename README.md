@@ -1,18 +1,15 @@
 # UpScaling — Real-Time Video Super-Resolution
 
 Real-time video upscaling pipeline targeted at in-cabin driver-monitoring streams
-(704×576 @ ~30 FPS). Five interchangeable backends are provided so you can pick
-the best speed / quality / VRAM trade-off for the deployment GPU:
+(704×576 @ ~30 FPS). Three interchangeable backends are provided:
 
 | Model | Native scale | Strength | When to use |
 |-------|--------------|----------|-------------|
-| **`realesrgan_gfpgan`** (Compact bg + GFPGAN-1.4 faces) | 4× | Best perceptual quality for faces — driver eyes/mouth/head-pose come out crisp; background handled by Compact | **Recommended for driver monitoring on A100** |
-| **`codeformer_compact`** (Compact bg + CodeFormer-v1 faces) | 4× | Same shape as the GFPGAN backend with a learned-codebook face prior — better on profile / occluded / low-light faces, less "plastic" skin | A/B against `realesrgan_gfpgan` to pick the face restorer |
-| **`basicvsrpp`** (BasicVSR++) | 4× | True temporal SR — bidirectional flow propagation eliminates per-frame flicker without RIFE | Use when temporal coherence on cabin reflections / hair / motion matters more than face detail |
-| **`flashvsr_tiny`** (FlashVSR-v1.1 Tiny) | 4× | Diffusion-class, temporal-aware | When you need diffusion-quality detail and can afford 4 GB+ VRAM |
+| **`realesrgan_gfpgan`** (Compact bg + GFPGAN-1.4 faces) | 4× | **Best perceptual quality for faces** — driver eyes/mouth/head-pose come out crisp; background handled by Compact | **Recommended for driver-monitoring on A100** |
+| **`flashvsr_tiny`** (FlashVSR-v1.1 Tiny) | 4× | Diffusion-class, temporal-aware | When you need temporal coherence and can afford 4 GB+ VRAM |
 | **`realesrgan_lite`** (`realesr-general-x4v3`) | 4× | Lightest (~10 MB), fastest per-frame | Throughput baseline / sanity check / multi-stream batching |
 
-All five share the same CLI, frame-skip + RIFE pipeline, SageAttention SDPA
+All three share the same CLI, frame-skip + RIFE pipeline, SageAttention SDPA
 patch, output layout, and `run_info.txt` schema.
 
 ---
@@ -108,39 +105,11 @@ GFPGAN-1.4 weights (333 MB) and facexlib's RetinaFace-ResNet50 detector
 (104 MB) auto-download to `weights/gfpgan/` and `weights/facexlib/` on
 first use; pre-fetch with `python scripts/download_weights.py --model gfpgan`.
 
-### CodeFormer + Compact (alternative face restorer)
-
-Same pipeline shape as `realesrgan_gfpgan`, with CodeFormer-v1's
-codebook-prior face restorer instead of GFPGAN-1.4. Useful when you want a
-direct A/B test against GFPGAN on cabin faces.
-
-```bash
-python -m src.infer --model codeformer_compact --input "Real Test Video/1.mp4" \
-    --seconds 3 --pre-resize 35% --frame-skip 2 --frame-interp rife --dtype fp16
-```
-
-Weights (~360 MB) auto-download to `weights/codeformer/` on first use, or
-pre-fetch with `python scripts/download_weights.py --model codeformer`.
-
-### BasicVSR++ (true temporal SR)
-
-```bash
-python -m src.infer --model basicvsrpp --input "Real Test Video/1.mp4" \
-    --seconds 3 --pre-resize 35% --frame-skip 1 --dtype fp32
-```
-
-Sliding-window bidirectional model — eliminates flicker that per-frame
-Compact has on cabin reflections / hair / clothing motion. Note: `--dtype
-fp16` is silently kept at fp32 inside the wrapper because internal flow
-ops don't autocast cleanly. Weights (~28 MB, mmediting REDS4 release)
-auto-download to `weights/basicvsrpp/`, pre-fetch with
-`python scripts/download_weights.py --model basicvsrpp`.
-
 ## 4. All CLI flags
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--model` | *required* | `flashvsr_tiny`, `realesrgan_lite`, `realesrgan_gfpgan`, `codeformer_compact`, or `basicvsrpp` |
+| `--model` | *required* | `flashvsr_tiny`, `realesrgan_lite`, or `realesrgan_gfpgan` |
 | `--input` / `-i` | *required* | single video OR directory |
 | `--output` / `-o` | `output` | output root |
 | `--seconds` | `0` | seconds to process; `0` = full video |
@@ -251,8 +220,6 @@ UpScaling/
 | `flashvsr_tiny` | `160x128` | 2 | repeat | on | none | **14.4** | 640×512 |
 | `flashvsr_tiny` | `160x128` | 2 | rife | on | none | 12.6 | 640×512 |
 | `realesrgan_gfpgan` | `none` (704×576) | 1 | none | – | none | 1.78 | **2816×2304** |
-| `codeformer_compact` | `35%` (246×202) | 1 | none | – | none | **3.63** | 984×808 |
-| `basicvsrpp` | `35%` (246×202) | 1 | none | – | none | **8.01** | 984×808 |
 
 Best per-knob results from the 211-run benchmark (`benchmarks/latest/`):
 

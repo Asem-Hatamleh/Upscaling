@@ -79,19 +79,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--esrgan-tile", type=int, default=0,
                    help="Tile size for VRAM-constrained inference (0 = no tile)")
 
-    # Face-restorer knobs (shared by realesrgan_gfpgan + codeformer_compact).
-    p.add_argument("--cf-fidelity", type=float, default=0.9,
-                   help="CodeFormer fidelity weight (0=hallucinate, 1=keep "
-                        "landmarks). 0.9 preserves driver identity; 0.5-0.7 "
-                        "are stylized.")
-    p.add_argument("--face-detect-all", action="store_true",
-                   help="Restore every detected face, not only the largest. "
-                        "Default: only the largest/center face — picks the "
-                        "driver and ignores background reflections.")
-    p.add_argument("--eye-dist-threshold", type=int, default=10,
-                   help="Drop faces whose detected eyes are closer than N "
-                        "source-pixels (filters tiny / hallucinated faces).")
-
     # Output toggles
     p.add_argument("--no-comparison", action="store_true",
                    help="Skip side-by-side comparison output")
@@ -318,10 +305,6 @@ def main(argv: list[str] | None = None) -> int:
         "model_name": args.esrgan_variant,
         "denoise_strength": args.esrgan_denoise,
         "tile": args.esrgan_tile,
-        # face-restorer knobs
-        "codeformer_fidelity": args.cf_fidelity,
-        "only_center_face": not args.face_detect_all,
-        "eye_dist_threshold": args.eye_dist_threshold,
     }
 
     cfg = UpscalerConfig(
@@ -359,6 +342,37 @@ def main(argv: list[str] | None = None) -> int:
         chunk_frames=args.chunk_frames,
         rife_weights=args.rife_weights,
         crf=args.crf,
+        run_tag=(
+            f"dt-{args.dtype}_tile-{args.esrgan_tile}_dn-{args.esrgan_denoise:g}_"
+            f"var-{args.esrgan_variant}_crf-{args.crf}"
+            if args.model.startswith("realesrgan") else
+            f"dt-{args.dtype}_chunk-{args.chunk_frames}_topk-{args.topk_ratio:g}_"
+            f"kv-{args.kv_ratio:g}_local-{args.local_range}_cf-{int(not args.no_color_fix)}_crf-{args.crf}"
+        ),
+        cli_args={
+            "model": args.model,
+            "output": args.output,
+            "scale": args.scale,
+            "pre_resize": args.pre_resize,
+            "frame_skip": args.frame_skip,
+            "frame_interp": args.frame_interp,
+            "rife_weights": args.rife_weights,
+            "sage_attn": args.sage_attn,
+            "quant": args.quant,
+            "dtype": args.dtype,
+            "device": args.device,
+            "chunk_frames": args.chunk_frames,
+            "topk_ratio": args.topk_ratio,
+            "kv_ratio": args.kv_ratio,
+            "local_range": args.local_range,
+            "color_fix": not args.no_color_fix,
+            "esrgan_variant": args.esrgan_variant,
+            "esrgan_denoise": args.esrgan_denoise,
+            "esrgan_tile": args.esrgan_tile,
+            "write_comparison": not args.no_comparison,
+            "write_upscaled": not args.no_upscaled,
+            "crf": args.crf,
+        },
     )
 
     videos = collect_videos(args.input)

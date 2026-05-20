@@ -67,14 +67,14 @@ class RunCfg:
     crf: int = 18
     video_path: str = ""               # filled in by the harness per-video
 
-    def to_argv(self, output_root: Path) -> list[str]:
+    def to_argv(self, output_root: Path, seconds: float = SECONDS) -> list[str]:
         in_path = self.video_path or str(INPUT_VIDEO)
         argv = [
             sys.executable, "-m", "src.infer",
             "--model", self.model,
             "--input", in_path,
             "--output", str(output_root),
-            "--seconds", str(SECONDS),
+            "--seconds", str(seconds),
             "--scale", str(self.scale),
             "--pre-resize", self.pre_resize,
             "--frame-skip", str(self.frame_skip),
@@ -208,68 +208,16 @@ def gen_gfpgan_runs() -> list[RunCfg]:
     scales = [4, 2]
     pre = ["35%", "50%", "none"]
     skips = [1, 2, 4]
+    interps = ["none", "repeat", "rife"]
     dtypes = ["fp16", "fp32"]
     for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
-        # skip 1 makes frame-interp irrelevant; force "none" for cleanliness
-        fi = "none" if sk == 1 else "rife"
-        runs.append(_with(BASE_GFPGAN,
-            label=f"gfpgan_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
-            scale=sc, pre_resize=pr, frame_skip=sk,
-            frame_interp=fi, dtype=dt,
-        ))
-    return runs
-
-
-BASE_CODEFORMER = RunCfg(
-    label="codeformer_base", model="codeformer_compact",
-    scale=4, pre_resize="50%", frame_skip=2, frame_interp="rife",
-    sage_attn=False, quant="none", dtype="fp16", crf=18,
-)
-
-
-def gen_codeformer_runs() -> list[RunCfg]:
-    """Same shape as the GFPGAN grid so the two face-restore backends are
-    directly A/B-comparable per video.
-    """
-    runs: list[RunCfg] = []
-    scales = [4, 2]
-    pre = ["35%", "50%", "none"]
-    skips = [1, 2, 4]
-    dtypes = ["fp16", "fp32"]
-    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
-        fi = "none" if sk == 1 else "rife"
-        runs.append(_with(BASE_CODEFORMER,
-            label=f"codeformer_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
-            scale=sc, pre_resize=pr, frame_skip=sk,
-            frame_interp=fi, dtype=dt,
-        ))
-    return runs
-
-
-BASE_BVSRPP = RunCfg(
-    label="bvsrpp_base", model="basicvsrpp",
-    scale=4, pre_resize="50%", frame_skip=1, frame_interp="none",
-    sage_attn=False, quant="none", dtype="fp32", crf=18,
-)
-
-
-def gen_basicvsrpp_runs() -> list[RunCfg]:
-    """BasicVSR++ is true temporal SR — frame-skip kneecaps the model's
-    bidirectional flow propagation, so we keep skip ∈ {1, 2} and lean on
-    pre-resize as the main throughput knob.
-    """
-    runs: list[RunCfg] = []
-    scales = [4, 2]
-    pre = ["35%", "50%", "none"]
-    skips = [1, 2]
-    dtypes = ["fp32"]    # arch internals don't autocast cleanly to fp16
-    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
-        fi = "none" if sk == 1 else "rife"
-        runs.append(_with(BASE_BVSRPP,
-            label=f"bvsrpp_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
-            scale=sc, pre_resize=pr, frame_skip=sk,
-            frame_interp=fi, dtype=dt,
-        ))
+        fis = ["none"] if sk == 1 else interps
+        for fi in fis:
+            runs.append(_with(BASE_GFPGAN,
+                label=f"gfpgan_grid_s{sc}_pr{pr}_sk{sk}_interp{fi}_{dt}",
+                scale=sc, pre_resize=pr, frame_skip=sk,
+                frame_interp=fi, dtype=dt,
+            ))
     return runs
 
 
@@ -314,8 +262,9 @@ _PEAK_RE = re.compile(r"peak_vram_mb=(\d+)")
 _OUT_RE = re.compile(r"-> (\S*output/\S+)")
 
 
-def run_one(cfg: RunCfg, output_root: Path, timeout: float = 360.0) -> RunResult:
-    argv = cfg.to_argv(output_root)
+def run_one(cfg: RunCfg, output_root: Path, timeout: float = 360.0,
+            seconds: float = SECONDS) -> RunResult:
+    argv = cfg.to_argv(output_root, seconds=seconds)
     res = RunResult(label=cfg.label, model=cfg.model, args=asdict(cfg))
     env = os.environ.copy()
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -517,6 +466,8 @@ def main() -> int:
     ap.add_argument("--out", default="output/benchmark")
     ap.add_argument("--timeout", type=float, default=300.0,
                     help="per-run subprocess timeout (s)")
+    ap.add_argument("--seconds", type=float, default=SECONDS,
+                    help="seconds to process per video")
     ap.add_argument("--models", default="flashvsr_tiny,realesrgan_lite",
                     help="comma-sep subset to benchmark")
     ap.add_argument("--videos", default=None,
@@ -526,8 +477,18 @@ def main() -> int:
                          "also under 'Real Test Video/' if a bare filename is given.")
     ap.add_argument("--limit", type=int, default=0,
                     help="cap total runs (0 = no cap, useful for smoke)")
+    ap.add_argument("--scales", default=None,
+                    help="comma-sep scale filter, e.g. 2 or 2,4")
+    ap.add_argument("--frame-skips", default=None,
+                    help="comma-sep frame-skip filter, e.g. 1,2,4")
+    ap.add_argument("--frame-interps", default=None,
+                    help="comma-sep frame-interp filter, e.g. none,repeat,rife")
+    ap.add_argument("--dtypes", default=None,
+                    help="comma-sep dtype filter, e.g. fp16,fp32")
     ap.add_argument("--dry-run", action="store_true",
                     help="just print the plan, don't execute")
+    ap.add_argument("--native-only", action="store_true",
+                    help="keep only runs with --pre-resize none")
     ap.add_argument("--resume", default=None,
                     help="path to existing runs.csv; skip labels already recorded "
                          "and append remaining runs to the same directory")
@@ -551,7 +512,15 @@ def main() -> int:
             if not p.exists():
                 print(f"video not found: {raw}", file=sys.stderr)
                 return 1
-            videos.append(p)
+            if p.is_dir():
+                vids = sorted(v for v in p.iterdir()
+                              if v.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi", ".webm"})
+                if not vids:
+                    print(f"no videos in directory: {p}", file=sys.stderr)
+                    return 1
+                videos.extend(vids)
+            else:
+                videos.append(p)
     else:
         if not INPUT_VIDEO.exists():
             print(f"input video not found: {INPUT_VIDEO}", file=sys.stderr)
@@ -588,10 +557,6 @@ def main() -> int:
         base_runs.extend(gen_realesrgan_runs())
     if "realesrgan_gfpgan" in models:
         base_runs.extend(gen_gfpgan_runs())
-    if "codeformer_compact" in models:
-        base_runs.extend(gen_codeformer_runs())
-    if "basicvsrpp" in models:
-        base_runs.extend(gen_basicvsrpp_runs())
 
     # Cross every config with every input video. Tag the label so resume + CSV
     # rows stay unique.
@@ -604,6 +569,20 @@ def main() -> int:
                 video_path=str(vp),
             ))
 
+    if args.native_only:
+        runs = [r for r in runs if r.pre_resize == "none"]
+    if args.scales:
+        allowed = {int(x.strip()) for x in args.scales.split(",") if x.strip()}
+        runs = [r for r in runs if r.scale in allowed]
+    if args.frame_skips:
+        allowed = {int(x.strip()) for x in args.frame_skips.split(",") if x.strip()}
+        runs = [r for r in runs if r.frame_skip in allowed]
+    if args.frame_interps:
+        allowed = {x.strip() for x in args.frame_interps.split(",") if x.strip()}
+        runs = [r for r in runs if r.frame_interp in allowed]
+    if args.dtypes:
+        allowed = {x.strip() for x in args.dtypes.split(",") if x.strip()}
+        runs = [r for r in runs if r.dtype in allowed]
     if done_labels:
         runs = [r for r in runs if r.label not in done_labels]
     if args.limit > 0:
@@ -644,7 +623,8 @@ def main() -> int:
         print(f"[bench] {i+1:3d}/{len(runs)} {cfg.label}  pr={cfg.pre_resize} "
               f"sk={cfg.frame_skip} sage={cfg.sage_attn} quant={cfg.quant} "
               f"dt={cfg.dtype} scale={cfg.scale}", flush=True)
-        r = run_one(cfg, output_root=ROOT / "output", timeout=args.timeout)
+        r = run_one(cfg, output_root=ROOT / "output", timeout=args.timeout,
+                    seconds=args.seconds)
         dt = time.perf_counter() - t0
         flat = _flatten(r)
         rows.append(flat)

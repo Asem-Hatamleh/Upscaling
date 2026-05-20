@@ -1,0 +1,3 @@
+[submodule "third_party/CodeFormer"]
+	path = third_party/CodeFormer
+	url = https://github.com/sczhou/CodeFormer.git
