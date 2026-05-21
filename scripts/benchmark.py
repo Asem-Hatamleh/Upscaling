@@ -315,6 +315,9 @@ def gen_codeformer_runs() -> list[RunCfg]:
 
 def gen_codeformer_temporal_runs(
     *,
+    scales: Iterable[int] | None = None,
+    pre_resizes: Iterable[str] | None = None,
+    dtypes: Iterable[str] | None = None,
     fidelities: Iterable[float] | None = None,
     eye_thresholds: Iterable[int] | None = None,
     denoise_values: Iterable[float] | None = None,
@@ -325,25 +328,28 @@ def gen_codeformer_temporal_runs(
     face/eye jitter.
     """
     runs: list[RunCfg] = []
-    scales = [4]
-    pre = ["80%", "85%", "90%", "95%", "none"]
+    scales = sorted(scales) if scales is not None else [4]
+    pre = list(pre_resizes) if pre_resizes is not None else [
+        "80%", "85%", "90%", "95%", "none",
+    ]
+    dtypes = sorted(dtypes) if dtypes is not None else ["fp16"]
     fidelities = (sorted(fidelities) if fidelities is not None
                   else [0.9, 0.95, 1.0])
     eye_thresholds = (sorted(eye_thresholds) if eye_thresholds is not None
                       else [15, 20, 25, 30])
     denoise_values = (sorted(denoise_values) if denoise_values is not None
                       else [1.0])
-    for sc, pr, cf, eye, denoise in itertools.product(
-            scales, pre, fidelities, eye_thresholds, denoise_values):
+    for sc, pr, cf, eye, denoise, dt in itertools.product(
+            scales, pre, fidelities, eye_thresholds, denoise_values, dtypes):
         runs.append(_with(
             BASE_CODEFORMER,
             label=(f"codeformer_temporal_s{sc}_pr{pr}_cf{cf:g}_"
-                   f"eye{eye}_dn{denoise:g}_fp16"),
+                   f"eye{eye}_dn{denoise:g}_{dt}"),
             scale=sc,
             pre_resize=pr,
             frame_skip=1,
             frame_interp="none",
-            dtype="fp16",
+            dtype=dt,
             esrgan_denoise=denoise,
             esrgan_tile=0,
             cf_fidelity=cf,
@@ -901,6 +907,12 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
+        scale_values = _csv_ints(args.scales, name="--scales",
+                                 lo=1) if args.scales else None
+        pre_resize_values = ([x.strip() for x in args.pre_resizes.split(",")
+                              if x.strip()] if args.pre_resizes else None)
+        dtype_values = ({x.strip() for x in args.dtypes.split(",")
+                         if x.strip()} if args.dtypes else None)
         cf_fidelities = _csv_floats(args.cf_fidelities, name="--cf-fidelities",
                                     lo=0.0, hi=1.0) if args.cf_fidelities else None
         eye_dist_thresholds = _csv_ints(args.eye_dist_thresholds,
@@ -1001,6 +1013,9 @@ def main() -> int:
         base_runs.extend(gen_face_enhance_best_runs())
     elif args.preset == "codeformer_temporal":
         base_runs.extend(gen_codeformer_temporal_runs(
+            scales=scale_values,
+            pre_resizes=pre_resize_values,
+            dtypes=dtype_values,
             fidelities=cf_fidelities,
             eye_thresholds=eye_dist_thresholds,
             denoise_values=esrgan_denoise_values,

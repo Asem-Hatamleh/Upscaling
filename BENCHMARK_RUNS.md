@@ -208,9 +208,10 @@ Notes:
 Extra useful filters:
 
 ```bash
+--scales 4,2
 --pre-resizes 80%,85%,90%,95%,none
 --esrgan-denoise-values 0.8,1.0
---dtypes fp16
+--dtypes fp16,fp32
 ```
 
 ## Generate Report
