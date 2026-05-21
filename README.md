@@ -223,31 +223,115 @@ wall time, end-to-end FPS.
 
 ## 6. Real-time / live-streaming strategy
 
-### Quick switch: `--live`
+### Production command (in-cabin driver-monitoring)
+
+Two recommended invocations, depending on which face restorer you ship.
+
+**`realesrgan_lite` (no face stage, fastest):**
 
 ```bash
 python -m src.infer --live \
   --model realesrgan_lite \
-  --input "Real Test Video/1.mp4" \
-  --pre-resize 80% --dtype fp16 --esrgan-denoise 1.0
+  --input "<source — file path or RTSP url>" \
+  --output output/final_run \
+  --scale 4 --pre-resize 80% \
+  --dtype fp16 --esrgan-denoise 1.0
 ```
 
-`--live` enables a producer/consumer pipeline that **overlaps decode, SR,
-and encode on three dedicated threads** — CPU and GPU work in parallel
-instead of taking turns. It also:
+**`codeformer_compact` (Compact bg + CodeFormer face, best identity preservation):**
 
-- forces `--no-comparison` (the side-by-side mp4 doubles work);
-- drops `--chunk-frames` to a small value (4) so time-to-first-output
-  stays low;
-- promotes `--encoder` to `auto`, which prefers `h264_nvenc` if PyAV's
-  ffmpeg build supports it (5–10× faster than libx264);
-- opens two real-time preview windows (`Original` + `Upscaled`)
-  decoupled from SR throughput. Press `q` or `ESC` in either window to
-  abort the run cleanly. Disable with `--no-preview` for headless
-  servers or when `DISPLAY` is unset.
+```bash
+python -m src.infer --live \
+  --model codeformer_compact \
+  --input "<source>" \
+  --output output/final_run \
+  --scale 4 --pre-resize 80% \
+  --dtype fp16 --esrgan-denoise 1.0 \
+  --cf-fidelity 1.0 --eye-dist-threshold 20
+```
 
-Tune `--io-threads N` (default `2`) to deepen the bounded queues between
-threads if your decoder is jittery (e.g. RTSP source).
+Every other flag stays at its default. The `--live` switch alone
+turns on the latency-critical pipeline; below is what it activates and
+how to tune further.
+
+### What `--live` turns on automatically
+
+| Activated by `--live` | Effect on latency |
+|-----------------------|-------------------|
+| **Threaded pipeline** (decode / SR / encode on separate threads) | CPU I/O overlaps with GPU SR — total wall time drops ~30 % |
+| **`--encoder auto`** (auto-picks `h264_nvenc` when available) | NVENC encode is 5-10× faster than libx264; saves ~30-50 ms/frame |
+| **`--chunk-frames 4`** (was 16 default) | Time-to-first-SR-frame drops from ~600 ms to ~150 ms |
+| **`--no-comparison`** (suppresses side-by-side mp4) | Cuts encode work in half |
+| **Two preview windows** (`Original` + `Upscaled`) | Independent of SR throughput — `Original` plays smooth at source fps regardless of SR speed (see "decoupled" subsection below) |
+| **Decode pacing to source fps** | Drops SR frames if SR can't keep up — preview stays smooth, mp4 reflects what SR completed (`dropped=N` printed at end) |
+
+### Model-level perf opts (always on, regardless of `--live`)
+
+| Optimization | Effect | Disable with |
+|--------------|--------|--------------|
+| `torch.inference_mode()` wrap | ~10-15 % vs `no_grad` | n/a |
+| `cudnn.benchmark = True` | Picks fastest conv algo for fixed input shape | n/a |
+| TF32 on matmul + cuDNN | ~2× matmul throughput on Ampere+ | n/a |
+| `channels_last` memory format on every Real-ESRGAN net + GFPGAN net | 5-15 % via Tensor Core NHWC kernels | n/a |
+| `torch.compile(mode='default')` on every Real-ESRGAN net + GFPGAN net | 20-50 % steady-state; 30-60 s warmup on first inference | `--no-compile` |
+| Batched RealESRGAN forward (`realesrgan_lite`, `realesrgan_full`) | 30-80 % via one big forward instead of N small ones | falls back automatically when `--esrgan-tile > 0` |
+
+`torch.compile` is **not** applied to the CodeFormer face net — it
+regressed on RTX 5050 + torch nightly. The CodeFormer bg upsampler is
+still compiled, so 30-40 % of its wall time still benefits.
+
+### Latency tuning checklist
+
+If preview still feels laggy after `--live`:
+
+1. **Confirm NVENC is being used.** Look for
+   `encoder=h264_nvenc` in the `[runner] live mode encoder=...` line.
+   If it says `libx264`, your PyAV/ffmpeg build lacks NVENC — either
+   install a build with NVENC (`pip install av --force-reinstall
+   --no-binary av` won't help; use a binary wheel from the NVENC-enabled
+   PyAV channel, or build ffmpeg with `--enable-nvenc`).
+
+2. **Check `dropped=N` at end of run.** If `dropped` is most of the
+   source frames, SR can't keep up and the Upscaled window will lag.
+   Drop pre-resize **down to your policy floor** (this branch's
+   in-cabin floor is `--pre-resize 85%`). On RTX 5050:
+
+   | `--pre-resize` | SR fps (lite) | Upscaled window |
+   |---|---:|---|
+   | `90%` | ~10 fps  | refreshes ~10 fps |
+   | `85%` | ~11.5 fps | refreshes ~11.5 fps |
+   | `80%` | ~13 fps  | refreshes ~13 fps |
+
+3. **Drop `--chunk-frames 1` for the lowest possible TTFB.** Tradeoff:
+   slightly lower throughput because each forward processes one frame
+   instead of four. Use this only when first-frame latency matters
+   more than steady-state fps.
+
+4. **Drop `--io-threads 1`.** Bounded queues at depth 1 minimize the
+   end-to-end pipeline latency at the cost of jitter tolerance. Use
+   for clean local file sources; raise back to `2` or `3` for jittery
+   network sources (RTSP).
+
+5. **Add `--no-preview`** if you don't need the windows. Removes the
+   cv2 GUI cost and unpins encode from the main thread; the encode
+   stage moves back to its own dedicated worker for full three-stage
+   overlap.
+
+6. **First run feels stuck for ~60 s.** That's `torch.compile`
+   warming up. Subsequent runs reuse the cached Inductor artifacts (in
+   `~/.cache/torch/inductor/`). For short ad-hoc runs where you don't
+   want to pay the warmup, add `--no-compile`.
+
+7. **Switch model to `realesrgan_lite`** if you don't actually need
+   face restoration. CodeFormer adds ~600 ms / face / frame on this
+   GPU; lite alone runs ~13 fps at 80% pre-resize on RTX 5050,
+   CodeFormer compact runs ~1.4 fps under the same conditions.
+
+8. **Profile if numbers don't match expectations.** Run
+   `python -m src.infer --no-preview --no-compile ...` to get a clean
+   baseline without the GUI / compile noise, compare to
+   `python -m src.infer --live ...` to see what the optimizations
+   actually buy on your hardware.
 
 ### How the preview is decoupled from SR pace
 
@@ -269,21 +353,22 @@ completed, so a slow SR yields a sparser mp4 — that's the realistic
 as possible with no pacing and no drops; behavior matches a normal
 batch run.
 
-Measured on this RTX 5050 with `realesrgan_lite`, fp16, source 25 fps,
-in-cabin pre-resize budget (≥ 85 % is the policy on this branch):
+Measured on this RTX 5050 with `realesrgan_lite` after compile +
+channels_last + batched forward kicked in (so steady-state, not first
+inference), fp16, source 25 fps:
 
 | `--pre-resize` | SR fps | dropped (6 s) | Original window | Upscaled window |
 |----------------|-------:|--------------:|-----------------|-----------------|
-| `90%`          | ~5     | most          | smooth 25 fps   | refreshes ~5 fps |
-| `85%`          | ~5.5   | most          | smooth 25 fps   | refreshes ~5.5 fps |
-| `80%`          | 5.9    | 106 / 150     | smooth 25 fps   | refreshes ~6 fps |
+| `90%`          | ~10    | most          | smooth 25 fps   | refreshes ~10 fps |
+| `85%`          | ~11.5  | most          | smooth 25 fps   | refreshes ~11.5 fps |
+| `80%`          | ~13    | most          | smooth 25 fps   | refreshes ~13 fps |
 
 The **Original** window stays smooth because it's driven from the
 source-fps clock on the main thread (independent of SR). The
-**Upscaled** window updates only when a new SR frame completes — until
-the SR backbone is faster (torch.compile / channels_last / TensorRT,
-deferred), the upscaled view will lag behind the original at high
-pre-resize values. That is the live tradeoff.
+**Upscaled** window updates only when a new SR frame completes — at
+in-cabin pre-resize values (≥ 85 %) on this GPU it will still lag
+behind the original by ~2× until the SR backbone is faster (TensorRT
+export, deferred). On A100 the gap closes.
 
 ### Other levers
 
