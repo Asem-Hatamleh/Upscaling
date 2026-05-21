@@ -55,6 +55,7 @@ class RunOptions:
     live: bool = False
     encoder: str = "libx264"      # libx264 | h264_nvenc | auto
     io_queue_depth: int = 2       # bounded queue depth between threads
+    preview: bool = False         # open two real-time cv2 windows in live mode
 
 
 @dataclass
@@ -104,7 +105,12 @@ def _live_stream(
     thread, connected by bounded queues. Comparison output is disabled;
     frame-skip is forced to 1. The SR step still runs inside
     ``torch.inference_mode()`` and benefits from cuDNN benchmark + TF32
-    set in infer.py."""
+    set in infer.py.
+
+    When ``opts.preview`` is True, the encode thread also drives two
+    cv2 windows ('Original' and 'Upscaled') side-by-side, rendering each
+    SR frame as it leaves the GPU. Press 'q' / ESC in either window to
+    abort the run early."""
     lr_w, lr_h = io_utils.resolve_preprocess(meta.width, meta.height, opts.pre_resize)
     out_dir = derive_out_dir(out_root, model_id, video_path, opts, lr_w, lr_h, quant, sage)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,14 +119,20 @@ def _live_stream(
     up_writer = (io_utils.VideoWriter(up_path, fps=fps, crf=opts.crf,
                                       encoder=encoder_name)
                  if up_path else None)
-    if up_path is None:
-        # Nothing to write — caller asked for both --no-upscaled and
-        # --no-comparison; that has no live use, but keep the path safe.
+    if up_path is None and not opts.preview:
+        # Nothing to write and nothing to show — caller asked for both
+        # --no-upscaled and --no-preview; bail rather than spin threads
+        # for no reason.
         return RunResult(out_dir, None, None, 0, 0, 0.0, 0.0)
 
-    # Bounded queues: depth D = opts.io_queue_depth. Each item is one chunk
-    # of frames (np.ndarray (N,H,W,3) uint8 RGB). A small depth keeps
+    # Bounded queues: depth D = opts.io_queue_depth. A small depth keeps
     # latency low; larger depth absorbs jitter on slow CPUs.
+    #
+    # Each queue item is a tuple ``(orig_chunk, payload_chunk)`` so the
+    # original full-resolution frames flow alongside the LR (decode_q)
+    # and the SR (sr_q) chunks. The encode/preview stage needs both
+    # because the cv2 'Original' window shows the source at native
+    # resolution.
     depth = max(1, int(opts.io_queue_depth))
     decode_q: queue.Queue = queue.Queue(maxsize=depth)
     sr_q: queue.Queue = queue.Queue(maxsize=depth)
@@ -130,6 +142,7 @@ def _live_stream(
     out_w = out_h = 0
     n_src = 0
     error_box: list[BaseException] = []
+    abort_event = threading.Event()
 
     def _decode_worker():
         try:
@@ -139,9 +152,14 @@ def _live_stream(
                 max_seconds=opts.seconds,
                 fps_hint=fps,
             ):
+                if abort_event.is_set():
+                    break
+                orig_chunk = chunk
                 if (lr_w, lr_h) != (meta.width, meta.height):
-                    chunk = io_utils.resize_batch(chunk, lr_w, lr_h, "bicubic")
-                decode_q.put(chunk)
+                    lr_chunk = io_utils.resize_batch(chunk, lr_w, lr_h, "bicubic")
+                else:
+                    lr_chunk = chunk
+                decode_q.put((orig_chunk, lr_chunk))
         except BaseException as e:
             error_box.append(e)
         finally:
@@ -155,7 +173,10 @@ def _live_stream(
                     item = decode_q.get()
                     if item is SENTINEL:
                         break
-                    sr_chunk = upscaler.upscale(item)
+                    if abort_event.is_set():
+                        continue
+                    orig_chunk, lr_chunk = item
+                    sr_chunk = upscaler.upscale(lr_chunk)
                     nat = upscaler.native_scale
                     if opts.out_scale != nat:
                         if opts.out_scale > nat:
@@ -169,21 +190,77 @@ def _live_stream(
                         sr_chunk = io_utils.resize_batch(sr_chunk, new_w, new_h, "bicubic")
                     out_h, out_w = sr_chunk.shape[1:3]
                     n_src += sr_chunk.shape[0]
-                    sr_q.put(sr_chunk)
+                    sr_q.put((orig_chunk, sr_chunk))
         except BaseException as e:
             error_box.append(e)
         finally:
             sr_q.put(SENTINEL)
 
-    def _encode_worker():
+    def _encode_worker_no_preview():
+        # Used when preview is OFF: encode happens on its own thread so
+        # decode/SR/encode all overlap. With preview ON, encode runs on
+        # the main thread (cv2 GUI is not portable across thread backends
+        # — Qt requires main, GTK does not — so we play safe).
         try:
             while True:
                 item = sr_q.get()
                 if item is SENTINEL:
                     break
-                up_writer.append(item)
+                _, sr_chunk = item
+                if up_writer is not None:
+                    up_writer.append(sr_chunk)
         except BaseException as e:
             error_box.append(e)
+
+    def _main_thread_encode_and_preview():
+        # Runs in the main thread. Drives cv2 imshow + waitKey, writes the
+        # mp4. ESC or 'q' aborts the run cleanly.
+        cv2 = None
+        windows_ready = False
+        try:
+            import cv2  # type: ignore
+            cv2.namedWindow("Original",  cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Upscaled",  cv2.WINDOW_NORMAL)
+            # Place original on the left, upscaled to its right.
+            cv2.resizeWindow("Original", meta.width, meta.height)
+            cv2.moveWindow("Original",  0, 0)
+            cv2.resizeWindow("Upscaled", meta.width, meta.height)
+            cv2.moveWindow("Upscaled",  meta.width + 30, 0)
+            windows_ready = True
+        except Exception as e:
+            print(f"[runner] preview disabled — cv2 setup failed: {e}")
+            cv2 = None
+
+        try:
+            while True:
+                item = sr_q.get()
+                if item is SENTINEL:
+                    break
+                orig_chunk, sr_chunk = item
+                if up_writer is not None:
+                    up_writer.append(sr_chunk)
+                if windows_ready and cv2 is not None:
+                    for orig_rgb, sr_rgb in zip(orig_chunk, sr_chunk):
+                        cv2.imshow("Original",
+                                   cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR))
+                        cv2.imshow("Upscaled",
+                                   cv2.cvtColor(sr_rgb,   cv2.COLOR_RGB2BGR))
+                        # waitKey(1) pumps the GUI event loop and lets the
+                        # user close the windows with q/ESC.
+                        k = cv2.waitKey(1) & 0xFF
+                        if k in (ord("q"), 27):  # 'q' or ESC
+                            abort_event.set()
+                            break
+        finally:
+            if windows_ready and cv2 is not None:
+                try:
+                    cv2.destroyAllWindows()
+                    # destroyAllWindows on some Wayland setups needs an
+                    # extra waitKey pump to actually close.
+                    for _ in range(3):
+                        cv2.waitKey(1)
+                except Exception:
+                    pass
 
     try:
         import torch as _t
@@ -196,12 +273,24 @@ def _live_stream(
     threads = [
         threading.Thread(target=_decode_worker, name="decode", daemon=True),
         threading.Thread(target=_sr_worker, name="sr", daemon=True),
-        threading.Thread(target=_encode_worker, name="encode", daemon=True),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    if opts.preview:
+        # Decode + SR on worker threads; encode + cv2 preview on the main
+        # thread so GUI calls land where backend libs expect them.
+        for t in threads:
+            t.start()
+        _main_thread_encode_and_preview()
+        for t in threads:
+            t.join()
+    else:
+        # All three stages run on dedicated threads so CPU encode (libx264
+        # or NVENC) overlaps with GPU SR and CPU decode.
+        threads.append(threading.Thread(target=_encode_worker_no_preview,
+                                        name="encode", daemon=True))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
     if up_writer is not None:
         up_writer.close()
     wall = time.perf_counter() - t0
@@ -235,6 +324,7 @@ def _live_stream(
             "out_res": f"{out_w}x{out_h}",
             "live": True,
             "encoder": encoder_name,
+            "preview": opts.preview,
         },
         timing={
             "source_frames": n_src,
@@ -249,7 +339,7 @@ def _live_stream(
     )
     rep.write()
     print(f"[runner] live mode encoder={encoder_name} chunk={opts.chunk_frames} "
-          f"queue_depth={depth}")
+          f"queue_depth={depth} preview={'on' if opts.preview else 'off'}")
     return RunResult(out_dir, up_path, None, n_src, n_src, wall, fps_e2e)
 
 

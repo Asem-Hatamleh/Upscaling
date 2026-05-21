@@ -192,7 +192,8 @@ done
 | `--no-upscaled` | off | skip upscaled-only output |
 | `--crf` | `18` | x264 / NVENC `cq` quality (lower = larger/better) |
 | `--encoder` | `libx264` | `libx264` / `h264_nvenc` / `auto`. NVENC is 5-10× faster than libx264 |
-| `--live` | off | Live-streaming mode: producer/consumer threading (decode/SR/encode overlap), implies `--no-comparison`, picks NVENC if available, small chunk for low TTFB |
+| `--live` | off | Live-streaming mode: producer/consumer threading (decode/SR/encode overlap), implies `--no-comparison`, picks NVENC if available, small chunk for low TTFB, opens two preview windows |
+| `--no-preview` | off | Disable the two real-time `Original` / `Upscaled` cv2 windows that `--live` opens by default. Use for headless servers |
 | `--io-threads` | `2` | bounded queue depth between live-mode pipeline threads |
 
 ### Dead flags (no effect on this branch)
@@ -238,10 +239,19 @@ instead of taking turns. It also:
 - drops `--chunk-frames` to a small value (4) so time-to-first-output
   stays low;
 - promotes `--encoder` to `auto`, which prefers `h264_nvenc` if PyAV's
-  ffmpeg build supports it (5–10× faster than libx264).
+  ffmpeg build supports it (5–10× faster than libx264);
+- opens two real-time preview windows (`Original` + `Upscaled`) that
+  render each SR frame as it leaves the GPU. Press `q` or `ESC` in
+  either window to abort the run cleanly. Disable with `--no-preview`
+  for headless servers or when `DISPLAY` is unset.
 
 Tune `--io-threads N` (default `2`) to deepen the bounded queues between
 threads if your decoder is jittery (e.g. RTSP source).
+
+Note: when the preview windows are on, encode runs on the main thread
+(cv2 GUI backends — Qt in particular — require GUI calls from the main
+thread). Decode and SR still run on worker threads. With `--no-preview`,
+encode moves back to its own thread for full three-stage overlap.
 
 ### Other levers
 

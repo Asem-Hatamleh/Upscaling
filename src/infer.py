@@ -121,12 +121,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Live-streaming mode: producer/consumer threading "
                         "for decode/SR/encode overlap, skip comparison output, "
                         "auto-pick NVENC if available, small chunk for low "
-                        "TTFB. Implies --no-comparison.")
+                        "TTFB. Implies --no-comparison. Also opens two "
+                        "real-time preview windows (original + upscaled) "
+                        "unless --no-preview is set.")
     p.add_argument("--io-threads", type=int, default=2,
                    help="Worker threads for decode+encode pipeline when "
                         "--live is set (decode + encode each run on their "
                         "own thread regardless; this controls the bounded "
                         "queue depth between them and the SR stage).")
+    p.add_argument("--no-preview", action="store_true",
+                   help="Disable the two-window live preview that --live "
+                        "shows by default. Use for headless servers or "
+                        "when DISPLAY is unset.")
 
     return p.parse_args(argv)
 
@@ -412,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         live=args.live,
         encoder=args.encoder,
         io_queue_depth=args.io_threads,
+        preview=args.live and not args.no_preview,
         run_tag=(
             f"dt-{args.dtype}_tile-{args.esrgan_tile}_dn-{args.esrgan_denoise:g}_"
             f"var-{args.esrgan_variant}_cf-{args.cf_fidelity:g}_"
@@ -448,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             "crf": args.crf,
             "encoder": args.encoder,
             "live": args.live,
+            "preview": args.live and not args.no_preview,
         },
     )
 
