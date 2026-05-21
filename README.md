@@ -190,7 +190,10 @@ done
 | `--eye-dist-threshold` | `10` | drop face detections whose eye centers are closer than N source-pixels. `20` kills tiny/jittery cabin detections |
 | `--no-comparison` | off | skip side-by-side output |
 | `--no-upscaled` | off | skip upscaled-only output |
-| `--crf` | `18` | x264 quality (lower = larger/better) |
+| `--crf` | `18` | x264 / NVENC `cq` quality (lower = larger/better) |
+| `--encoder` | `libx264` | `libx264` / `h264_nvenc` / `auto`. NVENC is 5-10× faster than libx264 |
+| `--live` | off | Live-streaming mode: producer/consumer threading (decode/SR/encode overlap), implies `--no-comparison`, picks NVENC if available, small chunk for low TTFB |
+| `--io-threads` | `2` | bounded queue depth between live-mode pipeline threads |
 
 ### Dead flags (no effect on this branch)
 
@@ -216,9 +219,31 @@ output/
 SageAttention status (always `off` on this branch), input args, frame counts,
 wall time, end-to-end FPS.
 
-## 6. Real-time strategy
+## 6. Real-time / live-streaming strategy
 
-For 704×576 @ 30 FPS in-cabin streams, the practical throughput levers are:
+### Quick switch: `--live`
+
+```bash
+python -m src.infer --live \
+  --model realesrgan_lite \
+  --input "Real Test Video/1.mp4" \
+  --pre-resize 80% --dtype fp16 --esrgan-denoise 1.0
+```
+
+`--live` enables a producer/consumer pipeline that **overlaps decode, SR,
+and encode on three dedicated threads** — CPU and GPU work in parallel
+instead of taking turns. It also:
+
+- forces `--no-comparison` (the side-by-side mp4 doubles work);
+- drops `--chunk-frames` to a small value (4) so time-to-first-output
+  stays low;
+- promotes `--encoder` to `auto`, which prefers `h264_nvenc` if PyAV's
+  ffmpeg build supports it (5–10× faster than libx264).
+
+Tune `--io-threads N` (default `2`) to deepen the bounded queues between
+threads if your decoder is jittery (e.g. RTSP source).
+
+### Other levers
 
 1. **Pre-resize input** — `--pre-resize 80%` keeps detail while cutting
    compute ~36%. For tighter budgets, `50%` (352×288 → 1408×1152 SR) is
@@ -226,15 +251,26 @@ For 704×576 @ 30 FPS in-cabin streams, the practical throughput levers are:
 2. **`--frame-skip 2`** + **`--frame-interp rife`** — SR runs every other
    frame; RIFE-HDv3 fills the gap. ~1.6× throughput at minor quality cost
    on non-face backbones. For face restorers, prefer `--frame-skip 1`
-   because RIFE can interpolate face features inconsistently.
+   because RIFE can interpolate face features inconsistently. Note:
+   `--frame-skip` is ignored under `--live` (the streaming pipeline runs
+   every frame to keep latency bounded).
 3. **`--dtype fp16`** — Real-ESRGAN Compact and RRDB both support `half=True`
    end-to-end; GFPGAN and CodeFormer paths also benefit.
 4. **`--esrgan-tile NN`** — tile size > 0 splits each frame into NN×NN
    patches with reflection padding for VRAM-tight machines. Costs throughput
    but lets you run native input on 4–6 GB GPUs.
+5. **`--encoder h264_nvenc`** — NVIDIA NVENC hardware encoder. Needs a
+   PyAV/ffmpeg build with NVENC support; the writer falls back to libx264
+   with a warning if NVENC isn't available. Use `--encoder auto` to pick
+   automatically.
 
-On A100 80 GB drop all the tricks: `--frame-skip 1`, `--frame-interp none`,
-`--pre-resize none`, `--dtype fp16`.
+Torch-side, the CLI also enables `cudnn.benchmark=True` and TF32 on
+matmul/cudnn on every run — the SR forward pass runs inside
+`torch.inference_mode()` (skips autograd bookkeeping, ~10-15% faster
+than `no_grad`).
+
+On A100 80 GB drop most of the tricks: `--live --pre-resize none
+--dtype fp16 --encoder h264_nvenc`.
 
 ## 7. Test clips
 

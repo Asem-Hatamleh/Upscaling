@@ -1,7 +1,19 @@
-"""Per-video orchestration: read -> (resize) -> skip+SR -> (interp) -> write."""
+"""Per-video orchestration: read -> (resize) -> skip+SR -> (interp) -> write.
+
+Two paths:
+
+- Default: collect frames, chunk through SR, write outputs. Supports
+  side-by-side comparison and frame-skip + RIFE gap-fill.
+- ``opts.live=True``: streaming producer/consumer threading. Decode,
+  SR, and encode run on their own threads so CPU I/O overlaps with GPU
+  SR. Comparison output is force-disabled. Frame-skip is forced to 1.
+"""
 from __future__ import annotations
 
+import queue
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -10,6 +22,18 @@ import numpy as np
 
 from . import io_utils, frame_skip, report
 from .models.base import BaseUpscaler
+
+
+def _inference_ctx():
+    """Wrap SR forward in ``torch.inference_mode()`` when torch is loaded.
+    Falls back to a no-op context manager if torch import fails (e.g. CPU
+    smoke tests). ``inference_mode`` is faster than ``no_grad`` because it
+    also disables version counter bookkeeping on tensors."""
+    try:
+        import torch
+        return torch.inference_mode()
+    except Exception:
+        return nullcontext()
 
 
 @dataclass
@@ -27,6 +51,10 @@ class RunOptions:
     crf: int = 18
     run_tag: str = ""
     cli_args: dict = field(default_factory=dict)
+    # Live-streaming knobs
+    live: bool = False
+    encoder: str = "libx264"      # libx264 | h264_nvenc | auto
+    io_queue_depth: int = 2       # bounded queue depth between threads
 
 
 @dataclass
@@ -61,6 +89,170 @@ def derive_out_dir(root: Path, model_id: str, video_path: Path,
     return root / model_id / "_".join(parts)
 
 
+def _live_stream(
+    upscaler: BaseUpscaler,
+    video_path: Path,
+    out_root: Path,
+    opts: RunOptions,
+    model_id: str,
+    quant: str,
+    sage: bool,
+    meta: io_utils.VideoMeta,
+    fps: float,
+) -> RunResult:
+    """Threaded streaming path. Decode -> SR -> encode each on their own
+    thread, connected by bounded queues. Comparison output is disabled;
+    frame-skip is forced to 1. The SR step still runs inside
+    ``torch.inference_mode()`` and benefits from cuDNN benchmark + TF32
+    set in infer.py."""
+    lr_w, lr_h = io_utils.resolve_preprocess(meta.width, meta.height, opts.pre_resize)
+    out_dir = derive_out_dir(out_root, model_id, video_path, opts, lr_w, lr_h, quant, sage)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    up_path = out_dir / "upscaled.mp4" if opts.write_upscaled else None
+    encoder_name = io_utils.resolve_encoder(opts.encoder)
+    up_writer = (io_utils.VideoWriter(up_path, fps=fps, crf=opts.crf,
+                                      encoder=encoder_name)
+                 if up_path else None)
+    if up_path is None:
+        # Nothing to write — caller asked for both --no-upscaled and
+        # --no-comparison; that has no live use, but keep the path safe.
+        return RunResult(out_dir, None, None, 0, 0, 0.0, 0.0)
+
+    # Bounded queues: depth D = opts.io_queue_depth. Each item is one chunk
+    # of frames (np.ndarray (N,H,W,3) uint8 RGB). A small depth keeps
+    # latency low; larger depth absorbs jitter on slow CPUs.
+    depth = max(1, int(opts.io_queue_depth))
+    decode_q: queue.Queue = queue.Queue(maxsize=depth)
+    sr_q: queue.Queue = queue.Queue(maxsize=depth)
+    SENTINEL = object()
+
+    peak_vram_mb = 0
+    out_w = out_h = 0
+    n_src = 0
+    error_box: list[BaseException] = []
+
+    def _decode_worker():
+        try:
+            for chunk in io_utils.iter_frame_chunks(
+                video_path,
+                chunk_size=max(1, opts.chunk_frames),
+                max_seconds=opts.seconds,
+                fps_hint=fps,
+            ):
+                if (lr_w, lr_h) != (meta.width, meta.height):
+                    chunk = io_utils.resize_batch(chunk, lr_w, lr_h, "bicubic")
+                decode_q.put(chunk)
+        except BaseException as e:
+            error_box.append(e)
+        finally:
+            decode_q.put(SENTINEL)
+
+    def _sr_worker():
+        nonlocal n_src, out_w, out_h
+        try:
+            with _inference_ctx():
+                while True:
+                    item = decode_q.get()
+                    if item is SENTINEL:
+                        break
+                    sr_chunk = upscaler.upscale(item)
+                    nat = upscaler.native_scale
+                    if opts.out_scale != nat:
+                        if opts.out_scale > nat:
+                            raise ValueError(
+                                f"requested out_scale {opts.out_scale}x exceeds "
+                                f"model native {nat}x"
+                            )
+                        ratio = opts.out_scale / nat
+                        new_w = int(round(sr_chunk.shape[2] * ratio))
+                        new_h = int(round(sr_chunk.shape[1] * ratio))
+                        sr_chunk = io_utils.resize_batch(sr_chunk, new_w, new_h, "bicubic")
+                    out_h, out_w = sr_chunk.shape[1:3]
+                    n_src += sr_chunk.shape[0]
+                    sr_q.put(sr_chunk)
+        except BaseException as e:
+            error_box.append(e)
+        finally:
+            sr_q.put(SENTINEL)
+
+    def _encode_worker():
+        try:
+            while True:
+                item = sr_q.get()
+                if item is SENTINEL:
+                    break
+                up_writer.append(item)
+        except BaseException as e:
+            error_box.append(e)
+
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            _t.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+    t0 = time.perf_counter()
+    threads = [
+        threading.Thread(target=_decode_worker, name="decode", daemon=True),
+        threading.Thread(target=_sr_worker, name="sr", daemon=True),
+        threading.Thread(target=_encode_worker, name="encode", daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if up_writer is not None:
+        up_writer.close()
+    wall = time.perf_counter() - t0
+
+    if error_box:
+        raise error_box[0]
+
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            peak_vram_mb = int(_t.cuda.max_memory_allocated() / (1024 * 1024))
+    except Exception:
+        pass
+
+    fps_e2e = n_src / wall if wall > 0 else 0.0
+    latency_src_ms = (wall / n_src * 1000.0) if n_src else 0.0
+
+    rep = report.RunReport(
+        out_dir=out_dir,
+        model=model_id,
+        quant=quant,
+        sage_attn=sage,
+        args={
+            **opts.cli_args,
+            "input": str(video_path),
+            "duration_s": f"{opts.seconds}  (0 = full video)",
+            "out_scale": f"{opts.out_scale}x",
+            "lr_resize": f"{lr_w}x{lr_h}",
+            "frame_skip": opts.frame_skip,
+            "frame_interp": opts.frame_interp,
+            "out_res": f"{out_w}x{out_h}",
+            "live": True,
+            "encoder": encoder_name,
+        },
+        timing={
+            "source_frames": n_src,
+            "sr_frames": n_src,
+            "wall_time_s": f"{wall:.2f}",
+            "e2e_fps": f"{fps_e2e:.2f}",
+            "latency_ms_per_source_frame": f"{latency_src_ms:.2f}",
+            "latency_ms_per_sr_frame": f"{latency_src_ms:.2f}",
+            "peak_vram_mb": peak_vram_mb,
+            "src_fps": f"{fps:.2f}",
+        },
+    )
+    rep.write()
+    print(f"[runner] live mode encoder={encoder_name} chunk={opts.chunk_frames} "
+          f"queue_depth={depth}")
+    return RunResult(out_dir, up_path, None, n_src, n_src, wall, fps_e2e)
+
+
 def process_video(
     upscaler: BaseUpscaler,
     video_path: Path,
@@ -73,6 +265,15 @@ def process_video(
 ) -> RunResult:
     meta = io_utils.probe(video_path)
     fps = meta.fps or 25.0
+
+    # Live-streaming path: producer/consumer threads, no upfront frame
+    # collection, no comparison output, no frame-skip.
+    if opts.live:
+        return _live_stream(
+            upscaler=upscaler, video_path=video_path, out_root=out_root,
+            opts=opts, model_id=model_id, quant=quant, sage=sage, meta=meta,
+            fps=fps,
+        )
 
     # 1) read source frames (full-res, used for side-by-side)
     src_frames = []
@@ -102,8 +303,13 @@ def process_video(
         out_dir.mkdir(parents=True, exist_ok=True)
         up_path = out_dir / "upscaled.mp4" if opts.write_upscaled else None
         cmp_path = out_dir / "comparison.mp4" if opts.write_comparison else None
-        up_writer = io_utils.VideoWriter(up_path, fps=fps, crf=opts.crf) if up_path else None
-        cmp_writer = io_utils.VideoWriter(cmp_path, fps=fps, crf=opts.crf) if cmp_path else None
+        encoder_name = io_utils.resolve_encoder(opts.encoder)
+        up_writer = (io_utils.VideoWriter(up_path, fps=fps, crf=opts.crf,
+                                          encoder=encoder_name)
+                     if up_path else None)
+        cmp_writer = (io_utils.VideoWriter(cmp_path, fps=fps, crf=opts.crf,
+                                           encoder=encoder_name)
+                      if cmp_path else None)
         peak_vram_mb = 0
         out_w = out_h = 0
         try:
@@ -114,25 +320,26 @@ def process_video(
             pass
         t0 = time.perf_counter()
         try:
-            for start in range(0, len(lr), max(1, opts.chunk_frames)):
-                end = min(len(lr), start + max(1, opts.chunk_frames))
-                sr_chunk = upscaler.upscale(lr[start:end])
-                nat = upscaler.native_scale
-                if opts.out_scale != nat:
-                    if opts.out_scale > nat:
-                        raise ValueError(
-                            f"requested out_scale {opts.out_scale}x exceeds model native "
-                            f"{nat}x; FlashVSR/Real-ESRGAN here only go up to 4x."
-                        )
-                    ratio = opts.out_scale / nat
-                    new_w = int(round(sr_chunk.shape[2] * ratio))
-                    new_h = int(round(sr_chunk.shape[1] * ratio))
-                    sr_chunk = io_utils.resize_batch(sr_chunk, new_w, new_h, "bicubic")
-                out_h, out_w = sr_chunk.shape[1:3]
-                if up_writer is not None:
-                    up_writer.append(sr_chunk)
-                if cmp_writer is not None:
-                    cmp_writer.append(io_utils.side_by_side(src[start:end], sr_chunk))
+            with _inference_ctx():
+                for start in range(0, len(lr), max(1, opts.chunk_frames)):
+                    end = min(len(lr), start + max(1, opts.chunk_frames))
+                    sr_chunk = upscaler.upscale(lr[start:end])
+                    nat = upscaler.native_scale
+                    if opts.out_scale != nat:
+                        if opts.out_scale > nat:
+                            raise ValueError(
+                                f"requested out_scale {opts.out_scale}x exceeds model native "
+                                f"{nat}x; Real-ESRGAN here only goes up to 4x."
+                            )
+                        ratio = opts.out_scale / nat
+                        new_w = int(round(sr_chunk.shape[2] * ratio))
+                        new_h = int(round(sr_chunk.shape[1] * ratio))
+                        sr_chunk = io_utils.resize_batch(sr_chunk, new_w, new_h, "bicubic")
+                    out_h, out_w = sr_chunk.shape[1:3]
+                    if up_writer is not None:
+                        up_writer.append(sr_chunk)
+                    if cmp_writer is not None:
+                        cmp_writer.append(io_utils.side_by_side(src[start:end], sr_chunk))
         finally:
             if up_writer is not None:
                 up_writer.close()
@@ -188,7 +395,8 @@ def process_video(
     except Exception:
         pass
     t0 = time.perf_counter()
-    sr_anchors = upscaler.upscale(anchors_lr)
+    with _inference_ctx():
+        sr_anchors = upscaler.upscale(anchors_lr)
     try:
         import torch as _t
         if _t.cuda.is_available():
@@ -226,11 +434,14 @@ def process_video(
     # 7) write outputs
     up_path = out_dir / "upscaled.mp4" if opts.write_upscaled else None
     cmp_path = out_dir / "comparison.mp4" if opts.write_comparison else None
+    encoder_name = io_utils.resolve_encoder(opts.encoder)
     if up_path is not None:
-        io_utils.encode_video(up_path, sr_full, fps=fps, crf=opts.crf)
+        io_utils.encode_video(up_path, sr_full, fps=fps, crf=opts.crf,
+                              encoder=encoder_name)
     if cmp_path is not None:
         side = io_utils.side_by_side(src, sr_full)
-        io_utils.encode_video(cmp_path, side, fps=fps, crf=opts.crf)
+        io_utils.encode_video(cmp_path, side, fps=fps, crf=opts.crf,
+                              encoder=encoder_name)
 
     # 8) report
     rep = report.RunReport(

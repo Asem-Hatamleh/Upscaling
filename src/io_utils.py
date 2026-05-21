@@ -60,6 +60,26 @@ def iter_frames(
         yield frame  # HxWx3 uint8 RGB
 
 
+def iter_frame_chunks(
+    path: str | os.PathLike,
+    chunk_size: int,
+    max_seconds: float | None = None,
+    fps_hint: float | None = None,
+) -> Iterator[np.ndarray]:
+    """Yield consecutive (N,H,W,3) uint8 RGB chunks of up to ``chunk_size``
+    frames each. The last chunk may be smaller. Streams from disk without
+    buffering the full video — used by the --live pipeline so RAM stays
+    bounded and time-to-first-SR-frame is small."""
+    buf: list[np.ndarray] = []
+    for f in iter_frames(path, max_seconds=max_seconds, fps_hint=fps_hint):
+        buf.append(f)
+        if len(buf) >= chunk_size:
+            yield np.stack(buf, axis=0)
+            buf = []
+    if buf:
+        yield np.stack(buf, axis=0)
+
+
 def list_videos(path: str | os.PathLike) -> list[Path]:
     p = Path(path)
     if p.is_file():
@@ -165,16 +185,75 @@ def _x264_options(crf: int, preset: str = "medium") -> dict[str, str]:
     }
 
 
+def _nvenc_options(crf: int, preset: str = "p4") -> dict[str, str]:
+    """h264_nvenc options. NVENC uses ``cq`` (constant-quality) instead of
+    libx264's crf, but accepts a similar 0-51 range so we pass the same
+    integer. Preset ``p4`` is 'medium' on the NVENC quality/speed curve
+    (p1=fastest, p7=highest quality)."""
+    return {
+        "cq": str(int(crf)),
+        "preset": preset,
+        "rc": "vbr",
+        "tune": "ll",          # low-latency tune — keeps GOP short for live
+        "colorprim": "bt709",
+        "transfer": "bt709",
+        "colormatrix": "bt709",
+    }
+
+
+def nvenc_available() -> bool:
+    """Return True if PyAV's ffmpeg build can construct an h264_nvenc
+    encoder. Cheap probe — opens an in-memory mp4 container, tries to add
+    the stream, closes it. Cached on first call."""
+    cached = getattr(nvenc_available, "_cached", None)
+    if cached is not None:
+        return cached
+    try:
+        import av  # PyAV
+        import io as _io
+        buf = _io.BytesIO()
+        container = av.open(buf, mode="w", format="mp4")
+        try:
+            container.add_stream("h264_nvenc", rate=30)
+            container.close()
+            ok = True
+        except Exception:
+            try:
+                container.close()
+            except Exception:
+                pass
+            ok = False
+    except Exception:
+        ok = False
+    setattr(nvenc_available, "_cached", ok)
+    return ok
+
+
+def resolve_encoder(choice: str) -> str:
+    """Map the user's --encoder choice to a concrete PyAV codec name."""
+    if choice in ("libx264", "h264_nvenc"):
+        return choice
+    if choice == "auto":
+        return "h264_nvenc" if nvenc_available() else "libx264"
+    raise ValueError(f"unknown encoder: {choice!r}")
+
+
 class VideoWriter:
-    """Lazy mp4 writer using PyAV (libx264). Tags colorspace bt709 so players
-    don't misrender chroma as colored-dot artifacts."""
+    """Lazy mp4 writer using PyAV. Tags colorspace bt709 so players don't
+    misrender chroma as colored-dot artifacts.
+
+    ``encoder`` accepts ``libx264`` (software, default) or ``h264_nvenc``
+    (NVIDIA GPU NVENC, 5-10x faster but needs an NVENC-enabled PyAV/ffmpeg
+    build and a Turing+ GPU)."""
 
     def __init__(self, path: str | os.PathLike, fps: float, crf: int = 18,
-                 pixel_format: str = "yuv420p") -> None:
+                 pixel_format: str = "yuv420p",
+                 encoder: str = "libx264") -> None:
         self.path = str(path)
         self.fps = float(fps)
         self.crf = int(crf)
         self.pixel_format = pixel_format
+        self.encoder = encoder
         self._container = None
         self._stream = None
         self._even_h = self._even_w = 0
@@ -187,11 +266,25 @@ class VideoWriter:
         self._even_h = h - (h % 2)
         self._even_w = w - (w % 2)
         self._container = av.open(self.path, mode="w")
-        self._stream = self._container.add_stream("libx264", rate=int(round(self.fps)))
+        try:
+            self._stream = self._container.add_stream(self.encoder, rate=int(round(self.fps)))
+        except Exception as e:
+            if self.encoder != "libx264":
+                # Encoder unavailable on this PyAV/ffmpeg build. Fall back to
+                # libx264 with a warning rather than aborting the live run.
+                print(f"[io_utils] encoder {self.encoder!r} unavailable ({e}); "
+                      f"falling back to libx264.")
+                self.encoder = "libx264"
+                self._stream = self._container.add_stream("libx264", rate=int(round(self.fps)))
+            else:
+                raise
         self._stream.width = self._even_w
         self._stream.height = self._even_h
         self._stream.pix_fmt = self.pixel_format
-        self._stream.options = _x264_options(self.crf)
+        if self.encoder == "h264_nvenc":
+            self._stream.options = _nvenc_options(self.crf)
+        else:
+            self._stream.options = _x264_options(self.crf)
         # Tag the bitstream colorspace, not only the encoder, so MP4 stream
         # metadata carries it through.
         try:
@@ -236,8 +329,10 @@ class VideoWriter:
 
 
 def encode_video(path: str | os.PathLike, frames: np.ndarray, fps: float,
-                 crf: int = 18, pixel_format: str = "yuv420p") -> None:
+                 crf: int = 18, pixel_format: str = "yuv420p",
+                 encoder: str = "libx264") -> None:
     """One-shot writer. Tags bt709 colorspace to avoid the colored-dot
     artifact that uncolor-tagged x264 mp4 files show in some players."""
-    with VideoWriter(path, fps=fps, crf=crf, pixel_format=pixel_format) as w:
+    with VideoWriter(path, fps=fps, crf=crf, pixel_format=pixel_format,
+                     encoder=encoder) as w:
         w.append(frames)

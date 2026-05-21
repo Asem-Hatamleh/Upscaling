@@ -110,6 +110,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--crf", type=int, default=18,
                    help="x264 quality (lower = bigger/better, 18 ~ visually lossless)")
 
+    # Live-streaming knobs
+    p.add_argument("--encoder", default="libx264",
+                   choices=["libx264", "h264_nvenc", "auto"],
+                   help="Video encoder. h264_nvenc uses the GPU NVENC chip "
+                        "(5-10x faster than libx264 software); requires a "
+                        "PyAV/ffmpeg build with NVENC support. 'auto' picks "
+                        "NVENC if available, else libx264.")
+    p.add_argument("--live", action="store_true",
+                   help="Live-streaming mode: producer/consumer threading "
+                        "for decode/SR/encode overlap, skip comparison output, "
+                        "auto-pick NVENC if available, small chunk for low "
+                        "TTFB. Implies --no-comparison.")
+    p.add_argument("--io-threads", type=int, default=2,
+                   help="Worker threads for decode+encode pipeline when "
+                        "--live is set (decode + encode each run on their "
+                        "own thread regardless; this controls the bounded "
+                        "queue depth between them and the SR stage).")
+
     return p.parse_args(argv)
 
 
@@ -317,6 +335,29 @@ def main(argv: list[str] | None = None) -> int:
               "(FlashVSR removed); continuing with torch SDPA.",
               file=sys.stderr)
 
+    # Torch-side perf flags for live streaming. cuDNN benchmark picks the
+    # fastest conv algo for the (now-fixed) input shape; enabling TF32 on
+    # Ampere+ trades a small amount of fp32 precision for ~2x matmul speed.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # --live implies no comparison + small chunk for low TTFB.
+    if args.live:
+        args.no_comparison = True
+        if args.chunk_frames > 8:
+            args.chunk_frames = 4
+        if args.encoder == "libx264":
+            args.encoder = "auto"  # prefer NVENC if the system has it
+
     extra: dict[str, object] = {
         "chunk_frames": args.chunk_frames,
         "topk_ratio": args.topk_ratio,
@@ -368,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
         chunk_frames=args.chunk_frames,
         rife_weights=args.rife_weights,
         crf=args.crf,
+        live=args.live,
+        encoder=args.encoder,
+        io_queue_depth=args.io_threads,
         run_tag=(
             f"dt-{args.dtype}_tile-{args.esrgan_tile}_dn-{args.esrgan_denoise:g}_"
             f"var-{args.esrgan_variant}_cf-{args.cf_fidelity:g}_"
@@ -402,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
             "write_comparison": not args.no_comparison,
             "write_upscaled": not args.no_upscaled,
             "crf": args.crf,
+            "encoder": args.encoder,
+            "live": args.live,
         },
     )
 
