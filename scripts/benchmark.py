@@ -313,7 +313,12 @@ def gen_codeformer_runs() -> list[RunCfg]:
     return runs
 
 
-def gen_codeformer_temporal_runs() -> list[RunCfg]:
+def gen_codeformer_temporal_runs(
+    *,
+    fidelities: Iterable[float] | None = None,
+    eye_thresholds: Iterable[int] | None = None,
+    denoise_values: Iterable[float] | None = None,
+) -> list[RunCfg]:
     """CodeFormer temporal-stability sweep.
 
     Uses high fidelity and stricter face thresholds to reduce frame-to-frame
@@ -322,18 +327,24 @@ def gen_codeformer_temporal_runs() -> list[RunCfg]:
     runs: list[RunCfg] = []
     scales = [4]
     pre = ["80%", "85%", "90%", "95%", "none"]
-    fidelities = [0.9, 0.95, 1.0]
-    eye_thresholds = [15, 20, 25, 30]
-    for sc, pr, cf, eye in itertools.product(scales, pre, fidelities, eye_thresholds):
+    fidelities = (sorted(fidelities) if fidelities is not None
+                  else [0.9, 0.95, 1.0])
+    eye_thresholds = (sorted(eye_thresholds) if eye_thresholds is not None
+                      else [15, 20, 25, 30])
+    denoise_values = (sorted(denoise_values) if denoise_values is not None
+                      else [1.0])
+    for sc, pr, cf, eye, denoise in itertools.product(
+            scales, pre, fidelities, eye_thresholds, denoise_values):
         runs.append(_with(
             BASE_CODEFORMER,
-            label=f"codeformer_temporal_s{sc}_pr{pr}_cf{cf:g}_eye{eye}_fp16",
+            label=(f"codeformer_temporal_s{sc}_pr{pr}_cf{cf:g}_"
+                   f"eye{eye}_dn{denoise:g}_fp16"),
             scale=sc,
             pre_resize=pr,
             frame_skip=1,
             frame_interp="none",
             dtype="fp16",
-            esrgan_denoise=1.0,
+            esrgan_denoise=denoise,
             esrgan_tile=0,
             cf_fidelity=cf,
             face_detect_all=False,
@@ -889,6 +900,21 @@ def main() -> int:
                          "missing from runs.csv; default skips them")
     args = ap.parse_args()
 
+    try:
+        cf_fidelities = _csv_floats(args.cf_fidelities, name="--cf-fidelities",
+                                    lo=0.0, hi=1.0) if args.cf_fidelities else None
+        eye_dist_thresholds = _csv_ints(args.eye_dist_thresholds,
+                                        name="--eye-dist-thresholds",
+                                        lo=0) if args.eye_dist_thresholds else None
+        esrgan_denoise_values = _csv_floats(
+            args.esrgan_denoise_values,
+            name="--esrgan-denoise-values",
+            lo=0.0,
+            hi=1.0,
+        ) if args.esrgan_denoise_values else None
+    except ValueError as e:
+        ap.error(str(e))
+
     # Resolve the input videos.
     videos: list[Path] = []
     if args.videos:
@@ -974,7 +1000,11 @@ def main() -> int:
     elif args.preset == "face_enhance_best":
         base_runs.extend(gen_face_enhance_best_runs())
     elif args.preset == "codeformer_temporal":
-        base_runs.extend(gen_codeformer_temporal_runs())
+        base_runs.extend(gen_codeformer_temporal_runs(
+            fidelities=cf_fidelities,
+            eye_thresholds=eye_dist_thresholds,
+            denoise_values=esrgan_denoise_values,
+        ))
     else:
         if "flashvsr_tiny" in models:
             base_runs.extend(gen_flashvsr_runs())
@@ -1027,22 +1057,15 @@ def main() -> int:
     if args.dtypes:
         allowed = {x.strip() for x in args.dtypes.split(",") if x.strip()}
         runs = [r for r in runs if r.dtype in allowed]
-    try:
-        if args.cf_fidelities:
-            allowed = _csv_floats(args.cf_fidelities, name="--cf-fidelities",
-                                  lo=0.0, hi=1.0)
-            runs = [r for r in runs if round(float(r.cf_fidelity), 6) in allowed]
-        if args.eye_dist_thresholds:
-            allowed = _csv_ints(args.eye_dist_thresholds,
-                                name="--eye-dist-thresholds", lo=0)
-            runs = [r for r in runs if r.eye_dist_threshold in allowed]
-        if args.esrgan_denoise_values:
-            allowed = _csv_floats(args.esrgan_denoise_values,
-                                  name="--esrgan-denoise-values",
-                                  lo=0.0, hi=1.0)
-            runs = [r for r in runs if round(float(r.esrgan_denoise), 6) in allowed]
-    except ValueError as e:
-        ap.error(str(e))
+    if cf_fidelities is not None:
+        runs = [r for r in runs if round(float(r.cf_fidelity), 6) in cf_fidelities]
+    if eye_dist_thresholds is not None:
+        runs = [r for r in runs if r.eye_dist_threshold in eye_dist_thresholds]
+    if esrgan_denoise_values is not None:
+        runs = [
+            r for r in runs
+            if round(float(r.esrgan_denoise), 6) in esrgan_denoise_values
+        ]
     if done_labels:
         runs = [r for r in runs if r.label not in done_labels]
     if args.limit > 0:
