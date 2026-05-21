@@ -90,6 +90,27 @@ def derive_out_dir(root: Path, model_id: str, video_path: Path,
     return root / model_id / "_".join(parts)
 
 
+class _Slot:
+    """Thread-safe single-slot latest-frame holder. ``put`` overwrites
+    silently; ``peek`` returns the most recent value or None. Used to
+    decouple the cv2 preview rendering rhythm from the SR throughput so
+    the 'Original' window stays smooth even when SR can't keep up."""
+
+    __slots__ = ("_lock", "_frame")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frame: Optional[np.ndarray] = None
+
+    def put(self, f: np.ndarray) -> None:
+        with self._lock:
+            self._frame = f
+
+    def peek(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._frame
+
+
 def _live_stream(
     upscaler: BaseUpscaler,
     video_path: Path,
@@ -101,16 +122,29 @@ def _live_stream(
     meta: io_utils.VideoMeta,
     fps: float,
 ) -> RunResult:
-    """Threaded streaming path. Decode -> SR -> encode each on their own
-    thread, connected by bounded queues. Comparison output is disabled;
-    frame-skip is forced to 1. The SR step still runs inside
-    ``torch.inference_mode()`` and benefits from cuDNN benchmark + TF32
-    set in infer.py.
+    """Threaded streaming path with optional dual-window preview.
 
-    When ``opts.preview`` is True, the encode thread also drives two
-    cv2 windows ('Original' and 'Upscaled') side-by-side, rendering each
-    SR frame as it leaves the GPU. Press 'q' / ESC in either window to
-    abort the run early."""
+    Pipeline (when ``opts.preview`` is on):
+
+        decode_thread  -> orig_slot      (paced at source fps)
+                       \\-> sr_q ----> sr_thread -> sr_slot, encode_q
+                                                    -> encode_thread -> mp4
+
+        main_thread (display): ticks at source fps,
+                               cv2.imshow(orig_slot, sr_slot)
+
+    The 'Original' window is decoupled from SR throughput — it always
+    plays at the source frame rate. The 'Upscaled' window updates as
+    soon as a new SR frame is ready; if SR can't keep up, it holds the
+    last rendered SR until the next one lands. To keep that decoupling
+    real, the decode worker paces itself to source fps and DROPS chunks
+    going into the SR queue when it is full (orig_slot still updates).
+    The mp4 contains every SR frame that completed, so a slow SR yields
+    a sparser mp4 — that's the realistic 'live' tradeoff.
+
+    With ``opts.preview`` off, the pipeline runs as fast as possible
+    (decode + SR + encode each on their own thread, no pacing, no
+    drops); behavior is identical to a normal batch run."""
     lr_w, lr_h = io_utils.resolve_preprocess(meta.width, meta.height, opts.pre_resize)
     out_dir = derive_out_dir(out_root, model_id, video_path, opts, lr_w, lr_h, quant, sage)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -125,26 +159,26 @@ def _live_stream(
         # for no reason.
         return RunResult(out_dir, None, None, 0, 0, 0.0, 0.0)
 
-    # Bounded queues: depth D = opts.io_queue_depth. A small depth keeps
-    # latency low; larger depth absorbs jitter on slow CPUs.
-    #
-    # Each queue item is a tuple ``(orig_chunk, payload_chunk)`` so the
-    # original full-resolution frames flow alongside the LR (decode_q)
-    # and the SR (sr_q) chunks. The encode/preview stage needs both
-    # because the cv2 'Original' window shows the source at native
-    # resolution.
     depth = max(1, int(opts.io_queue_depth))
-    decode_q: queue.Queue = queue.Queue(maxsize=depth)
     sr_q: queue.Queue = queue.Queue(maxsize=depth)
+    encode_q: queue.Queue = queue.Queue(maxsize=depth)
     SENTINEL = object()
+    orig_slot = _Slot() if opts.preview else None
+    sr_slot = _Slot() if opts.preview else None
 
     peak_vram_mb = 0
     out_w = out_h = 0
     n_src = 0
+    n_dropped = 0
     error_box: list[BaseException] = []
     abort_event = threading.Event()
+    target_dt = 1.0 / max(fps, 1.0)
 
     def _decode_worker():
+        nonlocal n_dropped
+        # Pacing wall-clock so we feed frames into SR at most at source
+        # fps under preview. Without preview, no pacing and no drops.
+        deadline = time.perf_counter()
         try:
             for chunk in io_utils.iter_frame_chunks(
                 video_path,
@@ -154,28 +188,47 @@ def _live_stream(
             ):
                 if abort_event.is_set():
                     break
-                orig_chunk = chunk
                 if (lr_w, lr_h) != (meta.width, meta.height):
                     lr_chunk = io_utils.resize_batch(chunk, lr_w, lr_h, "bicubic")
                 else:
                     lr_chunk = chunk
-                decode_q.put((orig_chunk, lr_chunk))
+                if opts.preview and orig_slot is not None:
+                    # Update the slot per-frame, pacing so the Original
+                    # window plays at source fps. This is intentionally
+                    # done frame-by-frame (not chunk-by-chunk) so the
+                    # display thread sees smooth motion even on chunk=4.
+                    for f in chunk:
+                        if abort_event.is_set():
+                            break
+                        now = time.perf_counter()
+                        if deadline > now:
+                            time.sleep(deadline - now)
+                        orig_slot.put(f)
+                        deadline += target_dt
+                    # Drop the SR chunk if SR can't keep up — preview
+                    # mode prioritizes smooth playback over completeness.
+                    try:
+                        sr_q.put_nowait(lr_chunk)
+                    except queue.Full:
+                        n_dropped += lr_chunk.shape[0]
+                else:
+                    sr_q.put(lr_chunk)
         except BaseException as e:
             error_box.append(e)
         finally:
-            decode_q.put(SENTINEL)
+            sr_q.put(SENTINEL)
 
     def _sr_worker():
         nonlocal n_src, out_w, out_h
         try:
             with _inference_ctx():
                 while True:
-                    item = decode_q.get()
+                    item = sr_q.get()
                     if item is SENTINEL:
                         break
                     if abort_event.is_set():
                         continue
-                    orig_chunk, lr_chunk = item
+                    lr_chunk = item
                     sr_chunk = upscaler.upscale(lr_chunk)
                     nat = upscaler.native_scale
                     if opts.out_scale != nat:
@@ -190,73 +243,71 @@ def _live_stream(
                         sr_chunk = io_utils.resize_batch(sr_chunk, new_w, new_h, "bicubic")
                     out_h, out_w = sr_chunk.shape[1:3]
                     n_src += sr_chunk.shape[0]
-                    sr_q.put((orig_chunk, sr_chunk))
+                    if opts.preview and sr_slot is not None:
+                        sr_slot.put(sr_chunk[-1])
+                    encode_q.put(sr_chunk)
         except BaseException as e:
             error_box.append(e)
         finally:
-            sr_q.put(SENTINEL)
+            encode_q.put(SENTINEL)
 
-    def _encode_worker_no_preview():
-        # Used when preview is OFF: encode happens on its own thread so
-        # decode/SR/encode all overlap. With preview ON, encode runs on
-        # the main thread (cv2 GUI is not portable across thread backends
-        # — Qt requires main, GTK does not — so we play safe).
+    def _encode_worker():
         try:
             while True:
-                item = sr_q.get()
+                item = encode_q.get()
                 if item is SENTINEL:
                     break
-                _, sr_chunk = item
                 if up_writer is not None:
-                    up_writer.append(sr_chunk)
+                    up_writer.append(item)
         except BaseException as e:
             error_box.append(e)
 
-    def _main_thread_encode_and_preview():
-        # Runs in the main thread. Drives cv2 imshow + waitKey, writes the
-        # mp4. ESC or 'q' aborts the run cleanly.
+    def _main_thread_display(workers_done: threading.Event):
+        # Runs in the main thread. Tick at source fps via cv2.waitKey.
+        # ESC or 'q' aborts. Exits when workers_done is set AND the
+        # final tick has rendered the last SR frame.
         cv2 = None
         windows_ready = False
         try:
             import cv2  # type: ignore
-            cv2.namedWindow("Original",  cv2.WINDOW_NORMAL)
-            cv2.namedWindow("Upscaled",  cv2.WINDOW_NORMAL)
-            # Place original on the left, upscaled to its right.
+            cv2.namedWindow("Original", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Upscaled", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Original", meta.width, meta.height)
-            cv2.moveWindow("Original",  0, 0)
+            cv2.moveWindow("Original", 0, 0)
             cv2.resizeWindow("Upscaled", meta.width, meta.height)
-            cv2.moveWindow("Upscaled",  meta.width + 30, 0)
+            cv2.moveWindow("Upscaled", meta.width + 30, 0)
             windows_ready = True
         except Exception as e:
             print(f"[runner] preview disabled — cv2 setup failed: {e}")
             cv2 = None
 
+        tick_ms = max(1, int(round(target_dt * 1000)))
         try:
             while True:
-                item = sr_q.get()
-                if item is SENTINEL:
-                    break
-                orig_chunk, sr_chunk = item
-                if up_writer is not None:
-                    up_writer.append(sr_chunk)
                 if windows_ready and cv2 is not None:
-                    for orig_rgb, sr_rgb in zip(orig_chunk, sr_chunk):
+                    orig = orig_slot.peek() if orig_slot is not None else None
+                    sr = sr_slot.peek() if sr_slot is not None else None
+                    if orig is not None:
                         cv2.imshow("Original",
-                                   cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR))
+                                   cv2.cvtColor(orig, cv2.COLOR_RGB2BGR))
+                    if sr is not None:
                         cv2.imshow("Upscaled",
-                                   cv2.cvtColor(sr_rgb,   cv2.COLOR_RGB2BGR))
-                        # waitKey(1) pumps the GUI event loop and lets the
-                        # user close the windows with q/ESC.
-                        k = cv2.waitKey(1) & 0xFF
-                        if k in (ord("q"), 27):  # 'q' or ESC
-                            abort_event.set()
-                            break
+                                   cv2.cvtColor(sr, cv2.COLOR_RGB2BGR))
+                    k = cv2.waitKey(tick_ms) & 0xFF
+                    if k in (ord("q"), 27):
+                        abort_event.set()
+                        break
+                else:
+                    time.sleep(target_dt)
+                if workers_done.is_set():
+                    # Final tick to flush the last SR onto screen.
+                    if windows_ready and cv2 is not None:
+                        cv2.waitKey(tick_ms)
+                    break
         finally:
             if windows_ready and cv2 is not None:
                 try:
                     cv2.destroyAllWindows()
-                    # destroyAllWindows on some Wayland setups needs an
-                    # extra waitKey pump to actually close.
                     for _ in range(3):
                         cv2.waitKey(1)
                 except Exception:
@@ -270,27 +321,30 @@ def _live_stream(
         pass
 
     t0 = time.perf_counter()
-    threads = [
+    workers_done = threading.Event()
+    workers = [
         threading.Thread(target=_decode_worker, name="decode", daemon=True),
         threading.Thread(target=_sr_worker, name="sr", daemon=True),
+        threading.Thread(target=_encode_worker, name="encode", daemon=True),
     ]
+    for t in workers:
+        t.start()
+
     if opts.preview:
-        # Decode + SR on worker threads; encode + cv2 preview on the main
-        # thread so GUI calls land where backend libs expect them.
-        for t in threads:
-            t.start()
-        _main_thread_encode_and_preview()
-        for t in threads:
-            t.join()
+        # Display loop owns the main thread until the workers finish, so
+        # the cv2 event pump keeps ticking even while SR is busy.
+        def _wait_then_signal():
+            for t in workers:
+                t.join()
+            workers_done.set()
+        joiner = threading.Thread(target=_wait_then_signal, daemon=True)
+        joiner.start()
+        _main_thread_display(workers_done)
+        joiner.join()
     else:
-        # All three stages run on dedicated threads so CPU encode (libx264
-        # or NVENC) overlaps with GPU SR and CPU decode.
-        threads.append(threading.Thread(target=_encode_worker_no_preview,
-                                        name="encode", daemon=True))
-        for t in threads:
-            t.start()
-        for t in threads:
+        for t in workers:
             t.join()
+
     if up_writer is not None:
         up_writer.close()
     wall = time.perf_counter() - t0
@@ -339,7 +393,8 @@ def _live_stream(
     )
     rep.write()
     print(f"[runner] live mode encoder={encoder_name} chunk={opts.chunk_frames} "
-          f"queue_depth={depth} preview={'on' if opts.preview else 'off'}")
+          f"queue_depth={depth} preview={'on' if opts.preview else 'off'} "
+          f"dropped={n_dropped}")
     return RunResult(out_dir, up_path, None, n_src, n_src, wall, fps_e2e)
 
 

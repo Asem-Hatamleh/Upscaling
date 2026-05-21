@@ -240,18 +240,49 @@ instead of taking turns. It also:
   stays low;
 - promotes `--encoder` to `auto`, which prefers `h264_nvenc` if PyAV's
   ffmpeg build supports it (5–10× faster than libx264);
-- opens two real-time preview windows (`Original` + `Upscaled`) that
-  render each SR frame as it leaves the GPU. Press `q` or `ESC` in
-  either window to abort the run cleanly. Disable with `--no-preview`
-  for headless servers or when `DISPLAY` is unset.
+- opens two real-time preview windows (`Original` + `Upscaled`)
+  decoupled from SR throughput. Press `q` or `ESC` in either window to
+  abort the run cleanly. Disable with `--no-preview` for headless
+  servers or when `DISPLAY` is unset.
 
 Tune `--io-threads N` (default `2`) to deepen the bounded queues between
 threads if your decoder is jittery (e.g. RTSP source).
 
-Note: when the preview windows are on, encode runs on the main thread
-(cv2 GUI backends — Qt in particular — require GUI calls from the main
-thread). Decode and SR still run on worker threads. With `--no-preview`,
-encode moves back to its own thread for full three-stage overlap.
+### How the preview is decoupled from SR pace
+
+The cv2 windows are driven from the main thread on a clock ticking at
+the source video's fps (25 fps for our test clips). The decode worker
+paces itself to source fps and updates a thread-safe "latest original
+frame" slot on every decoded frame — so the `Original` window plays
+smooth at source rate regardless of how slow SR is. The `Upscaled`
+window shows the most recent completed SR frame (also from a slot);
+when SR is slower than source, it holds the last SR frame until the
+next one lands.
+
+To keep that decoupling honest under heavy SR load, the decode worker
+**drops chunks** going into the SR queue when the queue is full
+(non-blocking `put_nowait`). The dropped count is printed at the end
+of every run, e.g. `dropped=106`. The mp4 contains every SR frame that
+completed, so a slow SR yields a sparser mp4 — that's the realistic
+"live source" tradeoff. With `--no-preview` the pipeline runs as fast
+as possible with no pacing and no drops; behavior matches a normal
+batch run.
+
+Measured on this RTX 5050 with `realesrgan_lite`, fp16, source 25 fps,
+in-cabin pre-resize budget (≥ 85 % is the policy on this branch):
+
+| `--pre-resize` | SR fps | dropped (6 s) | Original window | Upscaled window |
+|----------------|-------:|--------------:|-----------------|-----------------|
+| `90%`          | ~5     | most          | smooth 25 fps   | refreshes ~5 fps |
+| `85%`          | ~5.5   | most          | smooth 25 fps   | refreshes ~5.5 fps |
+| `80%`          | 5.9    | 106 / 150     | smooth 25 fps   | refreshes ~6 fps |
+
+The **Original** window stays smooth because it's driven from the
+source-fps clock on the main thread (independent of SR). The
+**Upscaled** window updates only when a new SR frame completes — until
+the SR backbone is faster (torch.compile / channels_last / TensorRT,
+deferred), the upscaled view will lag behind the original at high
+pre-resize values. That is the live tradeoff.
 
 ### Other levers
 
