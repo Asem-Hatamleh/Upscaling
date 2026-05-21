@@ -182,6 +182,37 @@ First run may download:
 weights/realesrgan/RealESRGAN_x4plus.pth
 ```
 
+## CodeFormer Temporal Test
+
+Use this when you want less face/eye jitter:
+
+```bash
+venv/bin/python scripts/benchmark.py \
+  --preset codeformer_temporal \
+  --videos "Real Test Video/9.mp4,6.mp4" \
+  --seconds 10 \
+  --scales 4 \
+  --cf-fidelities 0.9,0.95,1.0 \
+  --eye-dist-thresholds 15,20,25,30 \
+  --timeout 2800 \
+  --auto-resume
+```
+
+Notes:
+
+- `cf_fidelity` valid range is `0..1`; use `0.9`, not `9`.
+- Higher `cf_fidelity` keeps face closer to source, usually more stable.
+- Higher `eye_dist_threshold` skips tiny/weak face detections, usually less hallucination.
+- Keep `frame_skip=1` and `frame_interp=none` for temporal quality tests.
+
+Extra useful filters:
+
+```bash
+--pre-resizes 80%,85%,90%,95%,none
+--esrgan-denoise-values 0.8,1.0
+--dtypes fp16
+```
+
 ## Generate Report
 
 After benchmark finishes:

@@ -322,7 +322,7 @@ def gen_codeformer_temporal_runs() -> list[RunCfg]:
     runs: list[RunCfg] = []
     scales = [4]
     pre = ["80%", "85%", "90%", "95%", "none"]
-    fidelities = [1.0]
+    fidelities = [0.9, 0.95, 1.0]
     eye_thresholds = [15, 20, 25, 30]
     for sc, pr, cf, eye in itertools.product(scales, pre, fidelities, eye_thresholds):
         runs.append(_with(
@@ -752,11 +752,34 @@ def _write_run_meta(path: Path, args: argparse.Namespace, videos: list[Path]) ->
         "frame_skips": args.frame_skips,
         "frame_interps": args.frame_interps,
         "dtypes": args.dtypes,
+        "cf_fidelities": args.cf_fidelities,
+        "eye_dist_thresholds": args.eye_dist_thresholds,
+        "esrgan_denoise_values": args.esrgan_denoise_values,
         "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
+
+
+def _csv_floats(raw: str, *, name: str, lo: float | None = None,
+                hi: float | None = None) -> set[float]:
+    vals = {float(x.strip()) for x in raw.split(",") if x.strip()}
+    if lo is not None or hi is not None:
+        bad = [v for v in vals if (lo is not None and v < lo) or
+               (hi is not None and v > hi)]
+        if bad:
+            raise ValueError(f"{name} values out of range: {bad}")
+    return {round(v, 6) for v in vals}
+
+
+def _csv_ints(raw: str, *, name: str, lo: int | None = None) -> set[int]:
+    vals = {int(x.strip()) for x in raw.split(",") if x.strip()}
+    if lo is not None:
+        bad = [v for v in vals if v < lo]
+        if bad:
+            raise ValueError(f"{name} values out of range: {bad}")
+    return vals
 
 
 def write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -847,6 +870,12 @@ def main() -> int:
                     help="comma-sep frame-interp filter, e.g. none,repeat,rife")
     ap.add_argument("--dtypes", default=None,
                     help="comma-sep dtype filter, e.g. fp16,fp32")
+    ap.add_argument("--cf-fidelities", default=None,
+                    help="comma-sep CodeFormer fidelity filter, e.g. 0.9,0.95,1.0")
+    ap.add_argument("--eye-dist-thresholds", default=None,
+                    help="comma-sep CodeFormer face-size filter, e.g. 15,20,25,30")
+    ap.add_argument("--esrgan-denoise-values", default=None,
+                    help="comma-sep Real-ESRGAN denoise filter, e.g. 0.8,1.0")
     ap.add_argument("--dry-run", action="store_true",
                     help="just print the plan, don't execute")
     ap.add_argument("--resume", default=None,
@@ -998,6 +1027,22 @@ def main() -> int:
     if args.dtypes:
         allowed = {x.strip() for x in args.dtypes.split(",") if x.strip()}
         runs = [r for r in runs if r.dtype in allowed]
+    try:
+        if args.cf_fidelities:
+            allowed = _csv_floats(args.cf_fidelities, name="--cf-fidelities",
+                                  lo=0.0, hi=1.0)
+            runs = [r for r in runs if round(float(r.cf_fidelity), 6) in allowed]
+        if args.eye_dist_thresholds:
+            allowed = _csv_ints(args.eye_dist_thresholds,
+                                name="--eye-dist-thresholds", lo=0)
+            runs = [r for r in runs if r.eye_dist_threshold in allowed]
+        if args.esrgan_denoise_values:
+            allowed = _csv_floats(args.esrgan_denoise_values,
+                                  name="--esrgan-denoise-values",
+                                  lo=0.0, hi=1.0)
+            runs = [r for r in runs if round(float(r.esrgan_denoise), 6) in allowed]
+    except ValueError as e:
+        ap.error(str(e))
     if done_labels:
         runs = [r for r in runs if r.label not in done_labels]
     if args.limit > 0:
