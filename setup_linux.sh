@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# One-shot environment setup for the UpScaling project on Linux.
+# One-shot environment setup for the realesrgan-lite stack on Linux.
+#
+# Stack covered:
+#   - realesrgan_lite        (SRVGGNetCompact / realesr-general-x4v3)
+#   - realesrgan_full        (RRDBNet x4plus)
+#   - realesrgan_gfpgan      (Compact bg + GFPGAN-1.4 face restore)
+#   - codeformer_compact     (Compact bg + CodeFormer-v1 face restore)
 #
 # Tested on:
 #   - Ubuntu 24.04 / Python 3.11
@@ -7,25 +13,20 @@
 #   - Prod: NVIDIA A100 80 GB, CUDA 12.x
 #
 # Usage:
-#   ./setup_linux.sh            # full install (creates ./venv)
-#   ./setup_linux.sh --no-sage  # skip SageAttention build
-#   ./setup_linux.sh --no-bsa   # skip Block-Sparse-Attention build (FlashVSR will be slower)
-#
+#   ./setup_linux.sh                    # full install (creates ./venv)
+#   ./setup_linux.sh --no-downloads     # skip weight pre-fetch
+#   ./setup_linux.sh --python=python3.11
 set -euo pipefail
 
-WITH_SAGE=1
-WITH_BSA=1
 WITH_DOWNLOADS=1
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 
 for arg in "$@"; do
   case "$arg" in
-    --no-sage) WITH_SAGE=0 ;;
-    --no-bsa) WITH_BSA=0 ;;
     --no-downloads) WITH_DOWNLOADS=0 ;;
     --python=*) PYTHON_BIN="${arg#*=}" ;;
     -h|--help)
-      sed -n '1,40p' "$0"; exit 0 ;;
+      sed -n '1,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $arg"; exit 2 ;;
   esac
 done
@@ -55,7 +56,6 @@ source venv/bin/activate
 python -m pip install -U pip wheel setuptools
 
 # 2) PyTorch — pick the right wheel for your GPU
-#    Detect Blackwell (sm_120) vs Ampere/Hopper.
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 || echo unknown)"
 echo "[setup] GPU: $GPU_NAME"
 case "$GPU_NAME" in
@@ -79,11 +79,10 @@ esac
 #    into TMPDIR.
 pip install --no-cache-dir \
   numpy einops safetensors "huggingface_hub<2" imageio imageio-ffmpeg av Pillow \
-  opencv-python tqdm PyYAML modelscope \
-  diffusers "transformers==4.46.2" "accelerate<2" sentencepiece \
-  peft ftfy torchsde torchmetrics pytorch-lightning pandas \
-  bitsandbytes
-pip install --no-cache-dir --no-build-isolation basicsr gfpgan realesrgan
+  opencv-python tqdm PyYAML \
+  "transformers==4.46.2" \
+  lpips
+pip install --no-cache-dir --no-build-isolation basicsr gfpgan realesrgan facexlib
 
 # 3a) basicsr 1.4.2 still imports the removed torchvision.transforms.functional_tensor.
 #     Patch the one offending import so `import realesrgan` works.
@@ -93,63 +92,17 @@ if [[ -f "$BSR_DEG" ]]; then
   echo "[setup] patched $BSR_DEG"
 fi
 
-# 4) Clone FlashVSR + download weights
+# 4) Pre-fetch model weights (Real-ESRGAN, GFPGAN, CodeFormer, facexlib).
 if [[ $WITH_DOWNLOADS -eq 1 ]]; then
   python scripts/download_weights.py --model all
 else
   echo "[setup] skipping weight downloads (--no-downloads)"
 fi
 
-# 4a) Install FlashVSR's bundled diffsynth fork onto sys.path (editable, no deps —
-#     torch is already installed and FlashVSR's pinned torch==2.6.0+cu124 would
-#     downgrade our cu128 build).
-if [[ -d third_party/FlashVSR ]]; then
-  pip install --no-cache-dir --no-deps --no-build-isolation -e third_party/FlashVSR/ \
-    || echo "[setup] diffsynth editable install failed; sys.path injection will still work"
-fi
-
-# 4b) FlashVSR's wan_video_dit.py hard-imports block_sparse_attn. We don't build
-#     the kernel here (needs system CUDA toolkit + nvcc). Patch the import to be
-#     optional and the dispatch to fall back to dense SDPA when the kernel
-#     isn't present.
-WAN_DIT="third_party/FlashVSR/diffsynth/models/wan_video_dit.py"
-if [[ -f "$WAN_DIT" ]] && ! grep -q "BSA_AVAILABLE" "$WAN_DIT"; then
-  python - "$WAN_DIT" <<'PY'
-import sys, re
-p = sys.argv[1]
-src = open(p).read()
-src = src.replace(
-    "from block_sparse_attn import block_sparse_attn_func",
-    "try:\n"
-    "    from block_sparse_attn import block_sparse_attn_func\n"
-    "    BSA_AVAILABLE = True\n"
-    "except (ImportError, ModuleNotFoundError):\n"
-    "    block_sparse_attn_func = None\n"
-    "    BSA_AVAILABLE = False",
-)
-src = src.replace(
-    "def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):\n"
-    "    if attention_mask is not None:",
-    "def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):\n"
-    "    if attention_mask is not None and not BSA_AVAILABLE:\n"
-    "        q_d = rearrange(q, \"b s (n d) -> b n s d\", n=num_heads)\n"
-    "        k_d = rearrange(k, \"b s (n d) -> b n s d\", n=num_heads)\n"
-    "        v_d = rearrange(v, \"b s (n d) -> b n s d\", n=num_heads)\n"
-    "        x = F.scaled_dot_product_attention(q_d, k_d, v_d)\n"
-    "        x = rearrange(x, \"b n s d -> b s (n d)\", n=num_heads)\n"
-    "        if return_KV:\n"
-    "            return x, k, v\n"
-    "        return x\n"
-    "    if attention_mask is not None:",
-)
-open(p, "w").write(src)
-print("[setup] patched", p)
-PY
-fi
-
-# 4c) RIFE v6 weights are checked in, but the matching Python source isn't —
+# 4a) RIFE v6 weights are checked in, but the matching Python source isn't —
 #     ECCV2022-RIFE shipped the network code separately. Clone the repo once
-#     and copy the inference-time files into RIFE_trained_v6/model/.
+#     and copy the inference-time files into RIFE_trained_v6/model/. Only
+#     needed if you plan to use `--frame-interp rife`.
 if [[ ! -f RIFE_trained_v6/model/RIFE.py ]]; then
   if [[ ! -d third_party/RIFE ]]; then
     git clone --depth 1 https://github.com/megvii-research/ECCV2022-RIFE.git third_party/RIFE
@@ -186,41 +139,11 @@ PYEOF
   echo "[setup] RIFE source files installed in RIFE_trained_v6/model/"
 fi
 
-# 5) Block-Sparse-Attention (FlashVSR fast path)
-if [[ $WITH_BSA -eq 1 ]]; then
-  if ! python -c "import block_sparse_attn" 2>/dev/null; then
-    echo "[setup] building Block-Sparse-Attention from source"
-    mkdir -p third_party && cd third_party
-    if [[ ! -d Block-Sparse-Attention ]]; then
-      git clone --depth 1 https://github.com/mit-han-lab/Block-Sparse-Attention.git
-    fi
-    cd Block-Sparse-Attention
-    pip install -e . || echo "[setup] Block-Sparse-Attention build failed (FlashVSR will fall back)."
-    cd "$ROOT"
-  else
-    echo "[setup] block_sparse_attn already installed"
-  fi
-fi
-
-# 6) SageAttention (Linux only)
-if [[ $WITH_SAGE -eq 1 ]]; then
-  if ! python -c "import sageattention" 2>/dev/null; then
-    echo "[setup] installing SageAttention"
-    pip install --no-cache-dir sageattention || \
-      (echo "[setup] pypi sageattention failed; trying source build"; \
-       cd third_party && \
-       git clone --depth 1 https://github.com/thu-ml/SageAttention.git && \
-       cd SageAttention && pip install -e . || \
-       echo "[setup] SageAttention not installed; --sage-attn will fall back.")
-  else
-    echo "[setup] sageattention already installed"
-  fi
-fi
-
-# 7) Smoke check
+# 5) Smoke check
 python - <<'PY'
-import importlib, sys
-for m in ["torch", "numpy", "imageio", "PIL", "cv2"]:
+import importlib
+for m in ["torch", "numpy", "imageio", "PIL", "cv2", "realesrgan", "gfpgan",
+          "facexlib", "basicsr"]:
     try:
         importlib.import_module(m)
         print(f"  OK  {m}")
@@ -234,4 +157,4 @@ PY
 
 echo
 echo "[setup] DONE. Activate with:  source venv/bin/activate"
-echo "[setup] Try:  python -m src.infer --model flashvsr_tiny --input 'Real Test Video/1.mp4' --seconds 3 --pre-resize vga"
+echo "[setup] Try:  python -m src.infer --model realesrgan_lite --input 'Real Test Video/1.mp4' --seconds 3 --pre-resize 80%"

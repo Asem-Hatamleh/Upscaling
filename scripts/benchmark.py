@@ -111,12 +111,6 @@ class RunCfg:
 
 # ----------------------------- sweep grids ---------------------------------
 
-BASE_FLASH = RunCfg(label="flash_base", model="flashvsr_tiny",
-                    pre_resize="25%", frame_skip=2, sage_attn=True,
-                    quant="none", dtype="bf16", chunk_frames=16,
-                    topk_ratio=2.0, kv_ratio=3.0, local_range=11,
-                    color_fix=True, crf=18)
-
 BASE_REAL = RunCfg(label="real_base", model="realesrgan_lite",
                    pre_resize="25%", frame_skip=2, sage_attn=False,
                    quant="none", dtype="fp16", crf=18,
@@ -129,11 +123,6 @@ BASE_REAL_FULL = RunCfg(label="real_full_base", model="realesrgan_full",
 
 
 SCALES = [2, 4]
-# 8 GB Blackwell caps FlashVSR Tiny at ~640x512 SR (under the dense-SDPA
-# fallback). Anything 35%+ of 704x576 lands at 896x768 SR and OOMs. Include
-# a couple of doomed cells so the harness records the failure mode in the
-# CSV, but anchor the sweep on the sizes that actually fit.
-PRE_RESIZES_FLASH = ["15%", "20%", "25%", "30%", "35%", "50%"]
 # RealESRGAN runs per-frame; it's bounded only by tile size, not seqlen.
 PRE_RESIZES_REAL = ["70%", "80%", "none"]
 FRAME_SKIPS = [1, 2, 3, 4]
@@ -144,42 +133,6 @@ TOPK = [1.5, 2.0, 3.0]
 KV = [1.5, 3.0, 5.0]
 LOCAL = [9, 11]
 CRFS = [16, 18, 20, 23]
-
-
-def gen_flashvsr_runs() -> list[RunCfg]:
-    runs: list[RunCfg] = []
-
-    # 1) Cartesian over scale × pre-resize × frame-skip × sage_attn.
-    #    `--scale 2` doesn't change VRAM (the model is still native 4x;
-    #    we only post-downscale), but the user asked to test both, and the
-    #    output file size will differ.
-    for sc, pr, sk, sa in itertools.product(SCALES, PRE_RESIZES_FLASH, FRAME_SKIPS, [True, False]):
-        runs.append(_with(BASE_FLASH,
-            label=f"flash_grid_s{sc}_pr{pr}_sk{sk}_sa{int(sa)}",
-            scale=sc, pre_resize=pr, frame_skip=sk, sage_attn=sa,
-        ))
-
-    # 2) OFAT for the remaining knobs, around BASE_FLASH
-    ofat = [
-        ("quant", QUANTS, "quant"),
-        ("dtype", DTYPES, "dtype"),
-        ("chunk_frames", CHUNKS, "chunk"),
-        ("topk_ratio", TOPK, "topk"),
-        ("kv_ratio", KV, "kv"),
-        ("local_range", LOCAL, "local"),
-        ("color_fix", [True, False], "cf"),
-        ("crf", CRFS, "crf"),
-    ]
-    for field_name, values, short in ofat:
-        for v in values:
-            if getattr(BASE_FLASH, field_name) == v:
-                continue   # already covered by base
-            runs.append(_with(BASE_FLASH,
-                label=f"flash_ofat_{short}{v}",
-                **{field_name: v},
-            ))
-
-    return runs
 
 
 def gen_realesrgan_runs() -> list[RunCfg]:
@@ -416,33 +369,6 @@ def gen_face_enhance_best_runs() -> list[RunCfg]:
                 pre_resize="80%",
                 **{**common, "cf_fidelity": fidelity},
             ))
-    return runs
-
-
-BASE_BVSRPP = RunCfg(
-    label="bvsrpp_base", model="basicvsrpp",
-    scale=4, pre_resize="50%", frame_skip=1, frame_interp="none",
-    sage_attn=False, quant="none", dtype="fp32", crf=18,
-)
-
-
-def gen_basicvsrpp_runs() -> list[RunCfg]:
-    """BasicVSR++ is true temporal SR — frame-skip kneecaps the model's
-    bidirectional flow propagation, so we keep skip ∈ {1, 2} and lean on
-    pre-resize as the main throughput knob.
-    """
-    runs: list[RunCfg] = []
-    scales = [4, 2]
-    pre = ["35%", "50%", "none"]
-    skips = [1, 2]
-    dtypes = ["fp32"]    # arch internals don't autocast cleanly to fp16
-    for sc, pr, sk, dt in itertools.product(scales, pre, skips, dtypes):
-        fi = "none" if sk == 1 else "rife"
-        runs.append(_with(BASE_BVSRPP,
-            label=f"bvsrpp_grid_s{sc}_pr{pr}_sk{sk}_{dt}",
-            scale=sc, pre_resize=pr, frame_skip=sk,
-            frame_interp=fi, dtype=dt,
-        ))
     return runs
 
 
@@ -860,13 +786,13 @@ def main() -> int:
                     help="per-run subprocess timeout (s)")
     ap.add_argument("--seconds", type=float, default=SECONDS,
                     help="seconds to process per video")
-    ap.add_argument("--models", default="flashvsr_tiny,realesrgan_lite",
+    ap.add_argument("--models", default="realesrgan_lite,codeformer_compact",
                     help="comma-sep subset to benchmark")
     ap.add_argument("--preset", default="default",
                     choices=["default", "esrgan_target10", "face_enhance_best",
                              "codeformer_temporal"],
                     help="named sweep preset; esrgan_target10 tests lite/GFPGAN/"
-                         "CodeFormer at none/80%/70% looking for >=10 FPS; "
+                         "CodeFormer at none/80%%/70%% looking for >=10 FPS; "
                          "face_enhance_best tests current best face-quality args; "
                          "codeformer_temporal tests high-fidelity CodeFormer "
                          "with stricter face-detection thresholds")
@@ -880,7 +806,7 @@ def main() -> int:
     ap.add_argument("--scales", default=None,
                     help="comma-sep scale filter, e.g. 2 or 2,4")
     ap.add_argument("--pre-resizes", default=None,
-                    help="comma-sep pre-resize filter, e.g. none,80%,70%")
+                    help="comma-sep pre-resize filter, e.g. none,80%%,70%%")
     ap.add_argument("--frame-skips", default=None,
                     help="comma-sep frame-skip filter, e.g. 1,2,4")
     ap.add_argument("--frame-interps", default=None,
@@ -1021,8 +947,6 @@ def main() -> int:
             denoise_values=esrgan_denoise_values,
         ))
     else:
-        if "flashvsr_tiny" in models:
-            base_runs.extend(gen_flashvsr_runs())
         if "realesrgan_full" in models or "realesrgan" in models:
             base_runs.extend([
                 _with(
@@ -1043,8 +967,6 @@ def main() -> int:
             base_runs.extend(gen_gfpgan_runs())
         if "codeformer_compact" in models:
             base_runs.extend(gen_codeformer_runs())
-        if "basicvsrpp" in models:
-            base_runs.extend(gen_basicvsrpp_runs())
 
     # Cross every config with every input video. Tag the label so resume + CSV
     # rows stay unique.

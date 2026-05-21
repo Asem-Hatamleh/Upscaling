@@ -1,12 +1,19 @@
-"""Command-line inference entrypoint.
+"""Command-line inference entrypoint (realesrgan-lite stack).
 
 Usage examples:
-    python -m src.infer --model flashvsr_tiny --input "Real Test Video/1.mp4"
-    python -m src.infer --model flashvsr_tiny --input "Real Test Video" \\
-        --seconds 5 --scale 4 --pre-resize vga --frame-skip 2 --frame-interp rife \\
-        --sage-attn --quant int8_woq
+    python -m src.infer --model realesrgan_lite --input "Real Test Video/1.mp4"
+    python -m src.infer --model codeformer_compact --input "Test data/001.mp4" \\
+        --seconds 10 --scale 4 --pre-resize 80% \\
+        --frame-skip 1 --frame-interp none --dtype fp16 \\
+        --esrgan-denoise 1.0 --cf-fidelity 1.0 --eye-dist-threshold 20
 
 Output layout: ``output/<model>/<stem>_<args>/{upscaled.mp4, comparison.mp4, run_info.txt}``
+
+Note: FlashVSR-specific flags (--sage-attn, --quant, --chunk-frames,
+--topk-ratio, --kv-ratio, --local-range, --no-color-fix) are kept as
+dead defaults on this branch for backward compatibility with the
+benchmark harness; they have no effect on Real-ESRGAN / GFPGAN /
+CodeFormer paths.
 """
 from __future__ import annotations
 
@@ -15,19 +22,22 @@ import sys
 from pathlib import Path
 from typing import Iterable, List
 
-from . import io_utils, sage_patch
+from . import io_utils
 from .models.base import UpscalerConfig, available, build
 from .runner import RunOptions, process_video
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Real-time video upscaling pipeline (FlashVSR Tiny + alt).",
+        description="Real-time video upscaling pipeline (Real-ESRGAN / GFPGAN / CodeFormer).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     p.add_argument("--model", default=None,
-                   choices=sorted(available()) or ["flashvsr_tiny", "realesrgan_lite"],
+                   choices=sorted(available()) or ["realesrgan_lite",
+                                                   "realesrgan_full",
+                                                   "realesrgan_gfpgan",
+                                                   "codeformer_compact"],
                    help="Upscaler model. If omitted, prompts interactively.")
     p.add_argument("--interactive", "-I", action="store_true",
                    help="Force the interactive wizard for every option, even if "
@@ -303,10 +313,9 @@ def main(argv: list[str] | None = None) -> int:
         run_wizard(args)
 
     if args.sage_attn:
-        ok = sage_patch.enable()
-        if not ok:
-            print("[infer] sage-attn requested but unavailable; continuing with torch SDPA.",
-                  file=sys.stderr)
+        print("[infer] --sage-attn is a no-op in the realesrgan-lite stack "
+              "(FlashVSR removed); continuing with torch SDPA.",
+              file=sys.stderr)
 
     extra: dict[str, object] = {
         "chunk_frames": args.chunk_frames,
