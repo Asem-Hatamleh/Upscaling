@@ -68,6 +68,7 @@ class RealESRGANGFPGAN(BaseUpscaler):
         # "restore" into eerie low-res face stamps.
         self.only_center_face = bool(ex.get("only_center_face", True))
         self.detector = str(ex.get("face_detector", "retinaface_resnet50"))
+        self._compile = bool(ex.get("compile", True))
 
     # ------------- lifecycle -------------
     def load(self) -> None:
@@ -106,6 +107,21 @@ class RealESRGANGFPGAN(BaseUpscaler):
             channel_multiplier=2,
             bg_upsampler=bg_upsampler,
         )
+
+        # Perf opts on bg upsampler net + GFPGAN restoration net. The
+        # restorer pipeline (GFPGANer.enhance) is per-frame inside its
+        # wrapper, so we can't batch it — but we can still get
+        # channels_last + torch.compile on both nets.
+        from ._perf import apply_perf_opts
+        self.restorer.bg_upsampler.model = apply_perf_opts(
+            self.restorer.bg_upsampler.model,
+            compile=self._compile, channels_last=True,
+        )
+        if hasattr(self.restorer, "gfpgan"):
+            self.restorer.gfpgan = apply_perf_opts(
+                self.restorer.gfpgan,
+                compile=self._compile, channels_last=True,
+            )
 
         # GFPGANer instantiates facexlib's FaceRestoreHelper lazily on first
         # call. The detector backbone is picked up from

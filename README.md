@@ -195,6 +195,7 @@ done
 | `--live` | off | Live-streaming mode: producer/consumer threading (decode/SR/encode overlap), implies `--no-comparison`, picks NVENC if available, small chunk for low TTFB, opens two preview windows |
 | `--no-preview` | off | Disable the two real-time `Original` / `Upscaled` cv2 windows that `--live` opens by default. Use for headless servers |
 | `--io-threads` | `2` | bounded queue depth between live-mode pipeline threads |
+| `--no-compile` | off | Disable `torch.compile` on the SR + GFPGAN nets. Use for short runs (compile costs 30-60 s warmup) or to escape an Inductor crash on sm_120 + torch nightly |
 
 ### Dead flags (no effect on this branch)
 
@@ -309,6 +310,39 @@ Torch-side, the CLI also enables `cudnn.benchmark=True` and TF32 on
 matmul/cudnn on every run — the SR forward pass runs inside
 `torch.inference_mode()` (skips autograd bookkeeping, ~10-15% faster
 than `no_grad`).
+
+Three model-level perf opts are also active by default (disable with
+`--no-compile` if needed):
+
+1. **`channels_last` memory format** on every Real-ESRGAN net and on
+   the GFPGAN restoration net. Tensor Cores on Ampere+ / Blackwell are
+   most efficient on NHWC fp16 conv; cuDNN picks direct-NHWC kernels.
+   Output is bit-equal to NCHW — pure layout change.
+2. **`torch.compile(net, mode='default')`** on every Real-ESRGAN net,
+   plus the GFPGAN restoration net. TorchDynamo + Inductor fuse
+   adjacent conv+activation kernels and cut Python+CUDA dispatch
+   overhead. ~30-60 s warm-up on first inference; ~20-50 % steady-state
+   gain on SRVGGNetCompact / RRDBNet. **Not** applied to the CodeFormer
+   face net — its codebook Transformer + AdaIN path triggers graph
+   breaks on torch nightly that net a slowdown (measured -15 % on RTX
+   5050). The bg upsampler under CodeFormer still gets compiled, so
+   that 30-40 % of the codeformer wall time still benefits.
+3. **Batched RealESRGAN forward** in `realesrgan_lite` and
+   `realesrgan_full`. The default `RealESRGANer.enhance()` wrapper runs
+   one PyTorch forward per frame with H2D + D2H copies each time; we
+   bypass that and stack N frames into a single forward (one H2D, one
+   forward, one D2H). GFPGAN and CodeFormer keep their per-frame
+   restorer wrappers because the face restorer is structurally
+   per-image; only their bg upsamplers see batching today.
+
+Measured on RTX 5050, fp16, `--pre-resize 80%`, 10 s clip:
+
+| backend | `--live` baseline | + compile + channels_last + batched | speedup |
+|---------|------------------:|-----------------------------------:|--------:|
+| `realesrgan_lite`     | 6.3 fps  | **13.0 fps** | **+106 %** |
+| `realesrgan_full`     | (RRDB)   | **1.9 fps @ pr50%**          | n/a |
+| `realesrgan_gfpgan`   | (n/a)    | **1.6 fps**                  | n/a |
+| `codeformer_compact`  | 1.35 fps | **1.39 fps** (bg only — face net is the bottleneck) | +3 % |
 
 On A100 80 GB drop most of the tricks: `--live --pre-resize none
 --dtype fp16 --encoder h264_nvenc`.

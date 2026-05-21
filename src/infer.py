@@ -133,6 +133,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Disable the two-window live preview that --live "
                         "shows by default. Use for headless servers or "
                         "when DISPLAY is unset.")
+    p.add_argument("--no-compile", action="store_true",
+                   help="Disable torch.compile on the SR + face nets. "
+                        "Compile gives ~20-25%% steady-state speedup but "
+                        "adds 30-60 s warmup on first inference. Disable "
+                        "for short runs or when sm_120 + torch nightly "
+                        "throws an Inductor crash.")
 
     return p.parse_args(argv)
 
@@ -378,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         "codeformer_fidelity": args.cf_fidelity,
         "only_center_face": not args.face_detect_all,
         "eye_dist_threshold": args.eye_dist_threshold,
+        # Perf
+        "compile": not args.no_compile,
     }
 
     cfg = UpscalerConfig(

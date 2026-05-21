@@ -58,6 +58,8 @@ class RealESRGANLite(BaseUpscaler):
         self.denoise_strength = float((cfg.extra or {}).get("denoise_strength", 0.5))
         self.tile = int((cfg.extra or {}).get("tile", 0))
         self.tile_pad = int((cfg.extra or {}).get("tile_pad", 10))
+        self._compile = bool((cfg.extra or {}).get("compile", True))
+        self._half = False
 
     def load(self) -> None:
         import torch
@@ -79,6 +81,7 @@ class RealESRGANLite(BaseUpscaler):
             dni_weight = [self.denoise_strength, 1.0 - self.denoise_strength]
 
         half = self.cfg.dtype in ("fp16",)  # Real-ESRGAN supports half only
+        self._half = half
         self.upsampler = RealESRGANer(
             scale=4,
             model_path=model_path,
@@ -90,11 +93,32 @@ class RealESRGANLite(BaseUpscaler):
             half=half,
             device=self.cfg.device,
         )
+        # Perf opts: channels_last + torch.compile on the underlying net.
+        # RealESRGANer holds the (possibly DNI-blended) weights on .model.
+        from ._perf import apply_perf_opts
+        self.upsampler.model = apply_perf_opts(
+            self.upsampler.model, compile=self._compile, channels_last=True,
+        )
 
     def upscale(self, frames: np.ndarray) -> np.ndarray:
         import cv2
 
         assert self.upsampler is not None, "call .load() first"
+        # Fast path: batched forward bypasses RealESRGANer's per-frame
+        # wrapper. Only valid when no tile splitting is requested (tile=0).
+        if self.tile == 0:
+            try:
+                from ._perf import batched_realesrganer_enhance
+                return batched_realesrganer_enhance(
+                    self.upsampler, frames,
+                    device=self.cfg.device, half=self._half,
+                    scale=4, mod_pad=2,
+                )
+            except Exception as e:
+                print(f"[realesrgan_lite] batched path failed "
+                      f"({type(e).__name__}: {e}); falling back per-frame.")
+        # Fallback: original per-frame .enhance() loop. Used when tile > 0
+        # or when the batched path raises (e.g. an unexpected dtype).
         out_frames: list[np.ndarray] = []
         for f in frames:
             bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)

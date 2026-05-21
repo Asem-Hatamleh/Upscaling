@@ -78,6 +78,7 @@ class CodeFormerCompact(BaseUpscaler):
         self.denoise_strength = float(ex.get("denoise_strength", 0.5))
         self.bg_tile = int(ex.get("tile", 0))
         self.use_bg_upsampler = bool(ex.get("use_bg_upsampler", True))
+        self._compile = bool(ex.get("compile", True))
 
     # ------------- lifecycle -------------
     def load(self) -> None:
@@ -135,6 +136,18 @@ class CodeFormerCompact(BaseUpscaler):
                 model=bg_model, tile=self.bg_tile, tile_pad=10, pre_pad=0,
                 half=half, device=self.cfg.device,
             )
+            from ._perf import apply_perf_opts
+            self.bg_upsampler.model = apply_perf_opts(
+                self.bg_upsampler.model,
+                compile=self._compile, channels_last=True,
+            )
+
+        # NOTE: we deliberately do NOT apply torch.compile to the
+        # CodeFormer face net. Empirically (RTX 5050, torch nightly), the
+        # codebook Transformer + AdaIN path inside CodeFormer triggers
+        # graph breaks that net a *slowdown* (~15% measured on 5 s clips).
+        # The bg upsampler win above is the codeformer path's main perf
+        # gain; the face restorer stays in eager.
 
     # ------------- inference -------------
     def _restore_one(self, frame_bgr: np.ndarray) -> np.ndarray:

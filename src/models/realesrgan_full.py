@@ -47,6 +47,8 @@ class RealESRGANFull(BaseUpscaler):
         self.upsampler = None
         self.tile = int(ex.get("tile", 0))
         self.tile_pad = int(ex.get("tile_pad", 10))
+        self._compile = bool(ex.get("compile", True))
+        self._half = False
 
     def load(self) -> None:
         from basicsr.archs.rrdbnet_arch import RRDBNet  # type: ignore
@@ -62,6 +64,7 @@ class RealESRGANFull(BaseUpscaler):
             scale=4,
         )
         half = self.cfg.dtype == "fp16"
+        self._half = half
         self.upsampler = RealESRGANer(
             scale=4,
             model_path=str(weight),
@@ -73,11 +76,26 @@ class RealESRGANFull(BaseUpscaler):
             half=half,
             device=self.cfg.device,
         )
+        from ._perf import apply_perf_opts
+        self.upsampler.model = apply_perf_opts(
+            self.upsampler.model, compile=self._compile, channels_last=True,
+        )
 
     def upscale(self, frames: np.ndarray) -> np.ndarray:
         import cv2
 
         assert self.upsampler is not None, "call .load() first"
+        if self.tile == 0:
+            try:
+                from ._perf import batched_realesrganer_enhance
+                return batched_realesrganer_enhance(
+                    self.upsampler, frames,
+                    device=self.cfg.device, half=self._half,
+                    scale=4, mod_pad=2,
+                )
+            except Exception as e:
+                print(f"[realesrgan_full] batched path failed "
+                      f"({type(e).__name__}: {e}); falling back per-frame.")
         out_frames: list[np.ndarray] = []
         for f in frames:
             bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
