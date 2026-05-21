@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.mp4
+*.flv
+*.log
+bin/
+hf_cache/
+torch_cache/
+outputs/
+TestVideos/
+Notes/
