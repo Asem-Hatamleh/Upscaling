@@ -122,6 +122,30 @@ python -m src.infer --model codeformer_compact --input "Real Test Video/1.mp4" \
 Weights (~360 MB) auto-download to `weights/codeformer/` on first use, or
 pre-fetch with `python scripts/download_weights.py --model codeformer`.
 
+**Recommended in-cabin args** (validated against `Test data/`):
+
+```bash
+python -m src.infer --model codeformer_compact --input "Test data/001.mp4" \
+    --output output/final_run \
+    --seconds 10 --scale 4 --pre-resize 80% \
+    --frame-skip 1 --frame-interp none --dtype fp16 \
+    --esrgan-denoise 1.0 --cf-fidelity 1.0 --eye-dist-threshold 20
+```
+
+- `--cf-fidelity 1.0` — max identity preservation; the codebook stops
+  inventing eyes/mouth between frames (main source of inter-frame face
+  flicker we saw at `0.7`–`0.9`).
+- `--eye-dist-threshold 20` — drops tiny / mirror-reflection detections
+  that jitter the align matrix and trigger codebook flips.
+- `--esrgan-denoise 1.0` — full denoise blend for cabin sensor noise.
+- `--frame-skip 1` with `--frame-interp none` — keeps RIFE out of the
+  comparison so any remaining flicker is attributable to SR or the face
+  stage, not to gap-fill.
+
+`only_center_face=True` is the hard-coded default for `codeformer_compact`
+and `realesrgan_gfpgan`, so the driver's face is restored while passenger
+seat / rear-view reflections are ignored automatically.
+
 ### BasicVSR++ (true temporal SR)
 
 ```bash
@@ -161,6 +185,9 @@ auto-download to `weights/basicvsrpp/`, pre-fetch with
 | `--esrgan-variant` | `realesr-general-x4v3` | `realesr-animevideov3` for stylized inputs |
 | `--esrgan-denoise` | `0.5` | 0..1 noise/sharpness balance |
 | `--esrgan-tile` | `0` | tile size for VRAM-tight runs |
+| `--cf-fidelity` | `0.9` | CodeFormer identity weight: `0` hallucinates, `1` locks landmarks. Use `1.0` for in-cabin to kill codebook flicker |
+| `--face-detect-all` | off | restore every detected face. Default keeps only the largest/center (driver) and ignores mirror reflections |
+| `--eye-dist-threshold` | `10` | drop face detections whose eye centers are closer than N source-pixels. `20` kills tiny/jittery cabin detections |
 | `--no-comparison` | off | skip side-by-side output |
 | `--no-upscaled` | off | skip upscaled-only output |
 | `--crf` | `18` | x264 quality (lower = larger/better) |
@@ -197,15 +224,30 @@ requires combining several optimizations:
 On A100 80 GB you can drop most of the tricks: `--frame-skip 1`,
 `--frame-interp none`, `--quant none`, and rely on `--sage-attn` alone.
 
-## 7. Real test videos
+## 7. Test clips
+
+Two local-only clip sets, both gitignored:
 
 ```
-Real Test Video/
-├── 1.mp4   # 704x576 25 fps 32s   — primary test
+Real Test Video/      # short curated set, used by benchmark presets
+├── 1.mp4   # 704x576 25 fps 32s   — primary benchmark clip
 ├── 2.mp4
+├── 3.mp4
 ├── 4.mp4
-└── 5.mp4
+└── 5.mp4 … 9.mp4
+
+Test data/            # 100 in-cabin samples for final-run evaluation
+├── 001.mp4
+├── 002.mp4
+└── … 100.mp4
 ```
+
+A handful of `Test data/` clips ship with damaged H.264 NAL units
+(`error while decoding MB X Y, bytestream -N`). The decoder error-conceals
+and the upscaler runs through; the bad macroblock just becomes a brief
+artifact in that region of the output. Inspect with
+`ffmpeg -v error -i <clip> -f null -` before treating the result as ground
+truth.
 
 ## 8. Project layout
 
@@ -225,21 +267,28 @@ UpScaling/
 │   ├── rife_interp.py            # RIFE-HDv3 wrapper
 │   ├── sage_patch.py             # SageAttention SDPA patch
 │   └── models/
-│       ├── base.py               # Upscaler interface + registry
-│       ├── flashvsr_tiny.py      # FlashVSR-v1.1 Tiny wrapper
-│       ├── realesrgan_lite.py    # Real-ESRGAN baseline
-│       └── realesrgan_gfpgan.py  # Real-ESRGAN Compact + GFPGAN-1.4 face restore
+│       ├── base.py                 # Upscaler interface + registry
+│       ├── flashvsr_tiny.py        # FlashVSR-v1.1 Tiny wrapper
+│       ├── realesrgan_lite.py      # Real-ESRGAN Compact baseline
+│       ├── realesrgan_full.py      # Real-ESRGAN RRDB (x4plus) wrapper
+│       ├── realesrgan_gfpgan.py    # Compact bg + GFPGAN-1.4 face restore
+│       ├── codeformer_compact.py   # Compact bg + CodeFormer-v1 face restore
+│       ├── basicvsrpp.py           # BasicVSR++ true temporal SR
+│       └── _codeformer/            # vendored CodeFormer arch files
 ├── scripts/
 │   ├── download_weights.py
-│   ├── benchmark.py              # parameter sweep harness
+│   ├── benchmark.py              # parameter sweep harness (presets + OFAT)
 │   └── analyze_benchmark.py      # CSV → Markdown report
 ├── benchmarks/latest/            # last sweep's CSV / JSON / REPORT.md
 ├── third_party/FlashVSR/         # cloned by setup_linux.sh (gitignored)
 ├── weights/realesrgan/           # downloaded by setup_linux.sh (gitignored)
 ├── weights/gfpgan/               # GFPGANv1.4.pth (gitignored)
+├── weights/codeformer/           # codeformer.pth (gitignored)
+├── weights/basicvsrpp/           # BasicVSR++ REDS4 weights (gitignored)
 ├── weights/facexlib/             # RetinaFace ResNet50 + ParseNet (gitignored)
 ├── RIFE_trained_v6/              # checked-in RIFE-HDv3 weights + ECCV source
-└── Real Test Video/              # checked-in test clips
+├── Real Test Video/              # local clips (gitignored)
+└── Test data/                    # local in-cabin samples (gitignored)
 ```
 
 ## 9. Validated smoke-test configs (RTX 5050, 8 GB)
@@ -299,7 +348,7 @@ Notes:
   Python source. `setup_linux.sh` clones it and installs files into
   `RIFE_trained_v6/model/`.
 
-## 10. License
+## 11. License
 
 Source under MIT. FlashVSR weights are under the upstream license (see
 `third_party/FlashVSR/LICENSE`). Real-ESRGAN weights under BSD-3.

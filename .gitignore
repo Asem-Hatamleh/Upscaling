@@ -32,6 +32,7 @@ output/
 
 # Local test videos (kept on disk, not in git)
 Real Test Video/
+Test data/
 
 # macOS / IDE cruft
 __MACOSX/
