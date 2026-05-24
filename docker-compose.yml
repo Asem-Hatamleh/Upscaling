@@ -1,10 +1,10 @@
 services:
-  face-blur:
+  upscale-live:
     build:
       context: .
       dockerfile: Dockerfile
-    image: face-blur:latest
-    container_name: face-blur
+    image: upscale-live:latest
+    container_name: upscale-live
     restart: unless-stopped
     ports:
       - "1935:1935"      # RTMP push/play
@@ -14,7 +14,6 @@ services:
       - "8189:8189/udp"  # WebRTC ICE
     volumes:
       # live-edit source w/o rebuild
-      - ./blur_faces.py:/app/blur_faces.py
       - ./pipeline_live.py:/app/pipeline_live.py
       - ./LiveFeeder.py:/app/LiveFeeder.py
       - ./src:/app/src
@@ -28,7 +27,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
-      - YOLO_CONFIG_DIR=/tmp
       - PYTHONUNBUFFERED=1
     # default: start mediamtx + run pipeline. Override via `docker compose run` for custom args.
     command:
@@ -39,9 +37,9 @@ services:
         MTX_PID=$$!
         sleep 2
         echo "[ready] mediamtx up. Stream URLs once pipeline starts:"
-        echo "  RTMP : rtmp://<host>:1935/blur"
-        echo "  HLS  : http://<host>:8888/blur"
-        echo "  WebRTC: http://<host>:8889/blur"
+        echo "  RTMP : rtmp://<host>:1935/stream"
+        echo "  HLS  : http://<host>:8888/stream"
+        echo "  WebRTC: http://<host>:8889/stream"
         # keep mediamtx alive; pipeline launched manually via `docker compose exec`
         wait $$MTX_PID
     deploy:

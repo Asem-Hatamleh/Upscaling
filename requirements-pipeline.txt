@@ -1,6 +1,4 @@
-ultralytics>=8.2.0
-batch-face>=1.4.0
-# upscaling deps (realesrgan_lite path)
+# upscaling deps (realesrgan_lite + face restorers)
 realesrgan>=0.3.0
 basicsr>=1.4.2
 facexlib>=0.3.0
@@ -14,7 +12,6 @@ opencv-python>=4.9.0
 numpy>=1.24.0
 torch>=2.1.0
 torchvision>=0.16.0
-supervision>=0.21.0
 huggingface_hub>=0.23.0
 # pipeline_live.py / LiveFeeder.py
 websockets>=12.0

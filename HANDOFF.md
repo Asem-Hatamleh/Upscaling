@@ -221,8 +221,7 @@ stream out via mediamtx for RTMP / HLS / WebRTC / RTSP playback.
 
 | File | Purpose |
 |---|---|
-| `pipeline_live.py` | Main entrypoint. Threaded capture → detect → upscale → ffmpeg push pipeline. |
-| `blur_faces.py` | Face-blur module (RetinaFace / YOLO + GhostTracker). Used only when `--service blur` or `both`. |
+| `pipeline_live.py` | Main entrypoint. Threaded capture → upscale → ffmpeg push pipeline. (face-blur removed) |
 | `LiveFeeder.py` | `NodePlayer`: auth to Iotistic API, opens WS/HLS stream, decodes via cv2 to `frame_queue`. |
 | `bin/mediamtx*` | mediamtx binary (auto-downloaded on first run). |
 | `src/models/realesrgan_lite.py` | SR model wrapper (channels_last + torch.compile applied at load). |
@@ -231,13 +230,11 @@ stream out via mediamtx for RTMP / HLS / WebRTC / RTSP playback.
 ### 8.2 Architecture
 
 ```
-[NodePlayer ws://...flv -> growing temp file]
-    -> [_display_loop: cv2.VideoCapture decode -> frame_queue (maxsize 300)]
-        -> [capture_thread: drop-oldest -> capture_q (16)]
-            -> [detect_worker: batched; no-op when --service upscale]
-                -> [upscale_worker: batched SR -> out_q (16)]
-                    -> [main: imshow + ffmpeg pipe + RTMP push]
-                            -> [mediamtx 1935/8888/8889/8554]
+[NodePlayer ws://...flv -> ffmpeg pipe decode -> frame_queue (size 8)]
+    -> [capture_thread: drop-oldest -> capture_q (16)]
+        -> [upscale_worker: batched SR -> out_q (16)]
+            -> [main: imshow + ffmpeg pipe + RTMP push]
+                    -> [mediamtx 1935/8888/8889/8554]
 ```
 
 ### 8.3 Known issues & decisions
@@ -309,11 +306,12 @@ Useful analysis snippets in §8.5.
 ### 8.6 Recommended live config (RTX 5050 Laptop)
 
 ```
-python pipeline_live.py --service upscale \
+python pipeline_live.py \
+  --decode-fps 8 --queue-size 8 \
   --upscale-batch 2 --upscale-batch-timeout 0 \
   --upscale-pre-resize 0.8 --upscale-scale 4 \
   --upscale-denoise 0.3 \
-  --push-max-w 0 --x264-preset veryfast --push-crf 20 \
+  --push-max-w 4096 --x264-preset veryfast --push-crf 20 \
   --display --display-scale 0.5
 ```
 
@@ -343,7 +341,7 @@ session. Trade-offs:
 
 ### 8.8 Latest measured run (2026-05-24 12:07, RTX 5050 Laptop, sub stream)
 
-`python pipeline_live.py --service upscale --debug-log /tmp/sr_timeline.csv --debug-decode`
+`python pipeline_live.py --debug-log /tmp/sr_timeline.csv --debug-decode`
 
 ```
 frames processed : 641

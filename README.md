@@ -481,21 +481,22 @@ On A100 80 GB drop most of the tricks: `--live --pre-resize none
 
 ---
 
-## 7. Live IP-camera streaming pipeline (`pipeline_live.py`)
+## 7. Live IP-camera upscaling pipeline (`pipeline_live.py`)
 
 End-to-end live pipeline: pulls a WebSocket/FLV stream from an Iotistic
 MNVR IP camera, decodes via an ffmpeg subprocess (tolerant of corrupt
-FLV tags), runs Real-ESRGAN Lite super-resolution (and optional face-blur),
-pushes the processed feed to a local **mediamtx** server, re-publishable
-as RTMP / HLS / WebRTC / RTSP for browsers, VLC, or OBS.
+FLV tags), runs Real-ESRGAN Lite super-resolution, pushes the processed
+feed to a local **mediamtx** server, re-publishable as RTMP / HLS /
+WebRTC / RTSP for browsers, VLC, or OBS.
 
-Only on the `FullPipeline` branch.
+Branch scope: this branch contains the **upscaling-only** pipeline.
+Face-blur was removed (see `Upscaling-Streaming` branch history).
 
 ### 7.1 Architecture
 
 ```
    WebSocket FLV (wss://…/live/mnvr_…)
-            │ binary frames (arbitrary chunk sizes)
+            │
             ▼
    LiveFeeder.NodePlayer._save_and_show_video_ws
             │ writes raw FLV → recordings/*.flv
@@ -506,38 +507,33 @@ Only on the `FullPipeline` branch.
             │   [-vsync cfr -r <decode_fps>]
             │   -f rawvideo -pix_fmt bgr24 pipe:1
             ▼
-   stdout reader thread  ────► numpy BGR frame ────► player.frame_queue (size 8)
-            ▲                                              │
-            │ stderr reader parses "Video: …, WxH"         │ drop-oldest
-            │                                              ▼
-            ▼                                       capture_thread → capture_q
-   ffmpeg stderr (filtered: drops                          │
-   "Packet mismatch" / "decoding MB" spam)                 ▼
-                                              detect_worker → mid_q
-                                                            │
-                                                            ▼
-                                              upscale_worker (Real-ESRGAN Lite)
-                                                            │
-                                                            ▼
-                                              start_ffmpeg_pusher (h264_nvenc / libx264)
-                                                            │
-                                                            ▼
-                                              rtmp://localhost:1935/blur (mediamtx)
-                                                            │
-                                                            ▼
-                                              RTMP / HLS / WebRTC / RTSP clients
+   stdout reader thread ───► numpy BGR frame ───► player.frame_queue (size 8)
+                                                       │ drop-oldest
+                                                       ▼
+                                                  capture_thread → capture_q
+                                                       │
+                                                       ▼
+                                                  upscale_worker (Real-ESRGAN Lite)
+                                                       │
+                                                       ▼
+                                                  start_ffmpeg_pusher (h264_nvenc / libx264)
+                                                       │
+                                                       ▼
+                                                  rtmp://localhost:1935/stream (mediamtx)
+                                                       │
+                                                       ▼
+                                                  RTMP / HLS / WebRTC / RTSP clients
 ```
 
 Key design points:
 - **ffmpeg pipe decode**, not cv2.VideoCapture on a growing tempfile.
   ffmpeg's FLV demuxer with `+discardcorrupt -err_detect ignore_err`
   swallows the bogus `PreviousTagSize` fields the Iotistic gateway
-  emits; cv2 had no equivalent knob and produced `Packet mismatch`
-  storms plus silent frame drops.
+  emits.
 - **Decode-side fps cap** (`-vsync cfr -r N`) drops frames evenly at
   source instead of letting `frame_queue` evict them with drop-oldest.
-  Result: consecutive frames into the pipeline → smooth motion.
-- **Small `frame_queue` (8)** keeps consumed frames recent.
+- **Direct capture_q → upscale_worker.** No detect/blur stage. Single
+  GPU worker is the bottleneck.
 
 ### 7.2 Requirements
 
@@ -558,13 +554,13 @@ Key design points:
 ```bash
 # Linux
 source venv/bin/activate
-python pipeline_live.py --service upscale --display
+python pipeline_live.py --display
 ```
 
 ```powershell
 # Windows
 .\venv\Scripts\Activate.ps1
-python pipeline_live.py --service upscale --display --no-compile
+python pipeline_live.py --display --no-compile
 ```
 
 First run downloads `mediamtx` (~25 MB) to `./bin/` and the Real-ESRGAN
@@ -575,32 +571,24 @@ When the pipeline reports
 
 ```
 === STREAM URLS  (push res WxH) ===
-  RTMP   : rtmp://localhost:1935/blur
-  HLS    : http://localhost:8888/blur/index.m3u8
-  WebRTC : http://localhost:8889/blur
-  RTSP   : rtsp://localhost:8554/blur
-  Browser: http://localhost:8888/blur
+  RTMP   : rtmp://localhost:1935/stream
+  HLS    : http://localhost:8888/stream/index.m3u8
+  WebRTC : http://localhost:8889/stream
+  RTSP   : rtsp://localhost:8554/stream
+  Browser: http://localhost:8888/stream
 ```
 
 …open any of those URLs in VLC, browser, OBS, or a player to view
 the SR-enhanced feed. **WebRTC has the lowest latency** (sub-second);
 HLS has ~5–10 s latency but works everywhere.
 
-### 7.4 Modes — `--service`
+### 7.4 Stream selection
 
-| `--service` | What it runs |
-|---|---|
-| `upscale` (recommended) | Real-ESRGAN Lite only. Detector + blur skipped. |
-| `blur` | Face-blur only. Skips SR. |
-| `both` | Blur first, then SR. |
-
-### 7.5 Stream selection
-
-Defaults in `pipeline_live.py` lines 598-604 are baked for the dev
-device. Override on CLI:
+Defaults in `pipeline_live.py` argparse are baked for the dev device.
+Override on CLI:
 
 ```bash
-python pipeline_live.py --service upscale \
+python pipeline_live.py \
   --imei 867395071670570 --cam-id 4 \
   --username m.alawneh --password sgQZ9Oou3CsP \
   --stream-type sub --duration 60
@@ -610,59 +598,59 @@ python pipeline_live.py --service upscale \
 - `--stream-type main` — high-bitrate, full-res. Heavy.
 - `--duration N` — auto-stop after N seconds (default 30).
 
-### 7.6 Tuning knobs
+### 7.5 Tuning knobs
 
 ```bash
-# net 3.2x effective scale (default)
-python pipeline_live.py --service upscale --display
+# default 4x SR with no pre-resize
+python pipeline_live.py --display
 
-# true 2x net scale (less GPU work)
-python pipeline_live.py --service upscale --display \
+# net 2x scale (less GPU work)
+python pipeline_live.py --display \
   --upscale-scale 2 --upscale-pre-resize 1.0
 
-# pure 4x SR (most GPU work)
-python pipeline_live.py --service upscale --display \
-  --upscale-scale 4 --upscale-pre-resize 1.0
+# pre-shrink input before SR (3.2x net) — faster, smaller output
+python pipeline_live.py --display \
+  --upscale-scale 4 --upscale-pre-resize 0.8
 
 # bigger GPU batch (more throughput, more latency)
-python pipeline_live.py --service upscale --display \
-  --upscale-batch 8
+python pipeline_live.py --display --upscale-batch 8
 
-# sharp denoise (less smoothing)
-python pipeline_live.py --service upscale --display \
-  --upscale-denoise 0.3
+# sharper denoise
+python pipeline_live.py --display --upscale-denoise 0.3
 ```
 
 Quick reference:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--upscale-scale {2,4}` | `4` | Cosmetic + auto-pre-resize halving when 2. Model is hardcoded 4×. |
-| `--upscale-pre-resize` | `0.8` | Shrink input before SR. Combined w/ scale: `effective = 4 × pre × (0.5 if scale==2)` |
-| `--upscale-batch` | `4` | Frames per GPU forward |
+| `--upscale-scale {2,4}` | `4` | Cosmetic + auto-pre-resize halving when 2. Model hardcoded 4×. |
+| `--upscale-pre-resize` | `1.0` | Shrink input before SR. `effective = 4 × pre × (0.5 if scale==2)` |
+| `--upscale-batch` | `2` | Frames per GPU forward |
 | `--upscale-batch-timeout` | `0` (adaptive) | ms; 0 = derive from observed fps |
-| `--upscale-denoise` | `1.0` | 0=sharp 1=smooth (DNI blend) |
+| `--upscale-denoise` | `0.5` | 0=sharp 1=smooth (DNI blend) |
 | `--no-compile` | off | Disable torch.compile (Windows w/o triton) |
-| `--encoder` | `auto` | NVENC probed (256×256 nullsrc); fallback libx264 if session refused |
+| `--encoder` | `auto` | NVENC probed (256×256 nullsrc); auto-falls back to libx264 if session refused or width > 4096 |
 | `--x264-preset` | `veryfast` | `ultrafast`..`medium` |
 | `--push-crf` | `20` | x264 CRF (18 = visually lossless, 28 = lossy) |
 | `--push-bitrate` | none | Force bitrate cap (e.g. `6M`). Overrides `--push-crf` |
-| `--push-max-w` | `0` | Cap output width. 0 = keep full SR resolution |
+| `--push-max-w` | `0` | Cap output width. 0 = keep full SR resolution. NVENC h264 caps at 4096. |
 | `--push-fps` | `15.0` | Output stream framerate |
 | `--decode-fps` | `0` (= `--push-fps`) | Cap ffmpeg WS decoder fps. Lower = fewer queue evictions, smoother motion. Set to ≈ pipeline sustainable fps (≈8 on RTX 5050 @ 4×). |
 | `--queue-size` | `8` | `NodePlayer.frame_queue` maxsize. Smaller = fresher frames, larger = absorbs jitter. |
+| `--capture-q-size` | `16` | `capture_q` (capture→upscale worker) maxsize. |
+| `--out-q-size` | `16` | `out_q` (upscale→main) maxsize. |
 | `--display` | off | Show local OpenCV preview window |
-| `--display-scale` | `0.35` | Preview window shrink factor |
+| `--display-scale` | `1.0` | Preview window shrink factor |
 
-### 7.7 Recommended live config on RTX 5050 Laptop
+### 7.6 Recommended live config on RTX 5050 Laptop
 
 ```bash
-python pipeline_live.py --service upscale --display \
+python pipeline_live.py --display \
   --decode-fps 8 --queue-size 8 \
   --upscale-batch 2 --upscale-batch-timeout 0 \
   --upscale-pre-resize 0.8 --upscale-scale 4 \
   --upscale-denoise 0.3 \
-  --push-fps 15 --push-max-w 0 --push-crf 20
+  --push-fps 15 --push-max-w 4096 --push-crf 20
 ```
 
 Expected: ~8 fps effective end-to-end, ~1 s lag. With `--decode-fps 8`
@@ -671,61 +659,57 @@ sees consecutive frames and motion stays coherent. Real-time (25 fps)
 is **not** achievable on this GPU at 4× SR — accept the lag or move
 to A100.
 
-### 7.8 Debugging
-
-Two flags emit detailed traces:
+### 7.7 Debugging
 
 ```bash
-python pipeline_live.py --service upscale --display \
+python pipeline_live.py --display \
   --debug-log /tmp/sr_timeline.csv \
   --debug-decode
 ```
 
-- `--debug-log PATH` — per-frame CSV. Columns: seq, capture/enqueue/
-  detect/post/upscale/consume timestamps, all stage durations, n_faces,
-  out-of-order flag.
+- `--debug-log PATH` — per-frame CSV. Columns: `seq,capture_ts,enqueue_ts,upscale_start,upscale_end,consume_ts,qwait_ms,upscale_ms,e2e_ms,ooo_flag`.
 - `--debug-decode` — extra NodePlayer logs. Note: with the ffmpeg-pipe
   decoder the old "cap reopen / replay" path is gone; this flag is now
-  mostly a no-op but kept for backwards compatibility. Per-frame counts
-  surface in the end-of-run line `📊 Total frames decoded: N`.
+  mostly a no-op. End-of-run line `📊 Total frames decoded: N` surfaces
+  decoder throughput.
 
 Triage:
 
 ```bash
 # count out-of-order frames (should be 0)
-awk -F, 'NR>1 && $15==1' /tmp/sr_timeline.csv | wc -l
+awk -F, 'NR>1 && $10==1' /tmp/sr_timeline.csv | wc -l
 
 # mean upscale latency
-awk -F, 'NR>1 {s+=$12;n++} END {print s/n}' /tmp/sr_timeline.csv
+awk -F, 'NR>1 {s+=$8;n++} END {print s/n}' /tmp/sr_timeline.csv
 
 # source frames dropped between consumed seqs
 awk -F, 'NR<2{next} NR==2{p=$1;next} $1-p>1 {print "skipped",$1-p-1,"between",p,"->",$1} {p=$1}' /tmp/sr_timeline.csv | head
 ```
 
-### 7.9 Troubleshooting
+### 7.8 Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `stream not found` in browser/VLC | ffmpeg push died (check stderr) | usually NVENC failure — auto-falls back to libx264 since `_ffmpeg_has_nvenc()` runs a real probe |
 | `[mediamtx] failed: bind: address already in use` | stale mediamtx instance | pipeline auto-kills and retries; `pkill -f mediamtx` (Linux) / `taskkill /IM mediamtx.exe /F` (Win) manually if needed |
 | `[ffmpeg] pipe broken` on shutdown | normal — encoder still draining when stream ended | benign |
-| `[ffmpeg] pipe broken` mid-stream | encoder rejected resolution | set `--push-max-w 1920` (NVENC) or check stderr |
-| `[h264_nvenc] Frame Dimension less than the minimum supported value` | probe res too small | fixed — probe now uses 256×256. If you see it on push, lower `--push-max-w` is wrong direction; check that pre/post SR width ≥ 145 |
-| `[flv] Packet mismatch ... 11 ...` flood | source FLV has bogus `PreviousTagSize` (server-side) | fixed — ffmpeg-pipe decoder uses `+discardcorrupt -err_detect ignore_err` to swallow these. Any leftover lines are filtered in NodePlayer's stderr reader. |
+| `[h264_nvenc] Width X exceeds 4096` | NVENC consumer max width is 4096 | pipeline now auto-falls back to libx264 above 4096. Pass `--push-max-w 4096` to keep NVENC. |
+| `[ffmpeg] pipe broken` mid-stream | encoder rejected resolution / NVENC sessions exhausted | set `--push-max-w 3840` or `--encoder libx264` |
+| `[flv] Packet mismatch ... 11 ...` flood | source FLV has bogus `PreviousTagSize` (server-side) | fixed — ffmpeg-pipe decoder uses `+discardcorrupt -err_detect ignore_err` to swallow these |
 | `error while decoding MB X Y, bytestream -N` | corrupt H.264 NAL units | filtered in stderr reader. Single-frame artifact at most. |
 | Jerky / stuttering output, every-other-frame look | ffmpeg decode outpacing pipeline → queue evictions | set `--decode-fps` ≈ pipeline sustainable fps (e.g. `--decode-fps 8`) |
 | `ffmpeg never reported video size; aborting decoder` | source emitted no `Video:` line within 20 s | check the stream URL with `ffprobe wss://…` first, confirm credentials |
 | Qt segfault on exit | non-main-thread `cv2.waitKey` | fixed — main-thread guard in `pipeline_live.main` |
-| Browser shows blurry video | x264 too low quality | drop `--push-crf 18`, raise `--push-bitrate 10M`, or `--x264-preset fast` |
-| Local preview huge | SR output is 4× source | `--display-scale 0.35` (default) or `--display-max-w 1600` |
+| Pushed video appears soft | x264 CRF too high | drop `--push-crf 18`, raise `--push-bitrate 10M`, or `--x264-preset fast` |
+| Local preview huge | SR output is 4× source | `--display-scale 0.35` or `--display-max-w 1600` |
 | `OOM` on GPU | batch too large | lower `--upscale-batch` to 2 or 1 |
 
-### 7.10 Production deployment
+### 7.9 Production deployment
 
 For deploy on A100 (working NVENC + plenty of VRAM):
 
 ```bash
-python pipeline_live.py --service upscale \
+python pipeline_live.py \
   --decode-fps 25 --queue-size 16 \
   --upscale-batch 8 --upscale-pre-resize 1.0 --upscale-scale 4 \
   --upscale-denoise 0.3 \
@@ -734,19 +718,16 @@ python pipeline_live.py --service upscale \
   --no-rtmp                   # disable embedded mediamtx if pushing to external RTMP server
 ```
 
-On A100 the pipeline can sustain ≈25 fps end-to-end at 4× SR, so the
-decode cap and push fps both line up with the source rate (no
-frame-dropping). Bump `--decode-fps` higher if the source is 30 fps.
+On A100 the pipeline can sustain ≈25 fps end-to-end at 4× SR, so decode
+cap and push fps both line up with source rate (no frame-dropping).
+Bump `--decode-fps` to 30 if source is 30 fps.
 
-Run inside Docker (see `Dockerfile` + `docker-compose.yml` on this branch).
-The image bakes in ffmpeg w/ NVENC, mediamtx, all Python deps.
-
-### 7.11 Platform-specific run notes
+### 7.10 Platform-specific run notes
 
 **Linux (Ubuntu 24.04)**
 ```bash
 source venv/bin/activate
-python pipeline_live.py --service upscale --decode-fps 8
+python pipeline_live.py --decode-fps 8
 ```
 - `bin/mediamtx` auto-downloads on first run.
 - `recordings/*.flv` saved alongside; gitignored.
@@ -755,7 +736,7 @@ python pipeline_live.py --service upscale --decode-fps 8
 **Windows 10 / 11 (PowerShell)**
 ```powershell
 .\venv\Scripts\Activate.ps1
-python pipeline_live.py --service upscale --decode-fps 8 --no-compile
+python pipeline_live.py --decode-fps 8 --no-compile
 ```
 - `bin\mediamtx.exe` auto-downloads on first run.
 - ffmpeg must be on `PATH` (System → Environment Variables → Path).

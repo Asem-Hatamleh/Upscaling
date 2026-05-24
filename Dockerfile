@@ -1,4 +1,4 @@
-# Face-blur pipeline image. A100/Ampere+ ready (CUDA 12.1).
+# Upscaling live-streaming pipeline image. A100/Ampere+ ready (CUDA 12.1).
 FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -6,7 +6,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    YOLO_CONFIG_DIR=/tmp \
     OPENCV_FFMPEG_CAPTURE_OPTIONS="protocol_whitelist;file,http,https,tcp,tls,crypto"
 
 # system deps: ffmpeg (encode/decode), libs for opencv, curl/ca-certs for mediamtx download
@@ -38,7 +37,7 @@ RUN pip install --upgrade pip wheel "setuptools<70" \
 RUN python -c "import basicsr,os; p=os.path.join(os.path.dirname(basicsr.__file__),'data','degradations.py'); s=open(p).read().replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale','from torchvision.transforms.functional import rgb_to_grayscale'); open(p,'w').write(s)"
 
 # project files (flat layout: Upscaling repo root)
-COPY blur_faces.py pipeline_live.py LiveFeeder.py ./
+COPY pipeline_live.py LiveFeeder.py ./
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY RIFE_trained_v6/ ./RIFE_trained_v6/
