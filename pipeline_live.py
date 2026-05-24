@@ -23,10 +23,12 @@ import argparse
 import asyncio
 import logging
 import os
+import platform
 import queue
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.request
@@ -59,42 +61,119 @@ for _root in (Path(__file__).parent / "Upscaling", Path(__file__).parent):
 
 
 MEDIAMTX_VERSION = "1.9.3"
-MEDIAMTX_WIN_URL = f"https://github.com/bluenviron/mediamtx/releases/download/v{MEDIAMTX_VERSION}/mediamtx_v{MEDIAMTX_VERSION}_windows_amd64.zip"
 MEDIAMTX_DIR = Path(__file__).parent / "bin"
 
 
+def _mediamtx_release() -> tuple[str, str, str]:
+    """Return (download_url, archive_name, exe_name) for the current OS."""
+    sys_name = platform.system().lower()
+    machine = platform.machine().lower()
+    base = f"https://github.com/bluenviron/mediamtx/releases/download/v{MEDIAMTX_VERSION}"
+    if sys_name == "windows":
+        return (
+            f"{base}/mediamtx_v{MEDIAMTX_VERSION}_windows_amd64.zip",
+            "mediamtx.zip",
+            "mediamtx.exe",
+        )
+    if sys_name == "linux":
+        arch = "arm64v8" if ("aarch64" in machine or "arm64" in machine) else "amd64"
+        return (
+            f"{base}/mediamtx_v{MEDIAMTX_VERSION}_linux_{arch}.tar.gz",
+            "mediamtx.tar.gz",
+            "mediamtx",
+        )
+    if sys_name == "darwin":
+        arch = "arm64" if ("arm64" in machine or "aarch64" in machine) else "amd64"
+        return (
+            f"{base}/mediamtx_v{MEDIAMTX_VERSION}_darwin_{arch}.tar.gz",
+            "mediamtx.tar.gz",
+            "mediamtx",
+        )
+    raise RuntimeError(f"unsupported platform: {sys_name}/{machine}")
+
+
 def ensure_mediamtx() -> Path:
-    """Download mediamtx (Windows) on first run. Return path to exe."""
-    exe = MEDIAMTX_DIR / "mediamtx.exe"
+    """Download mediamtx for the current OS on first run. Return path to executable."""
+    url, archive_name, exe_name = _mediamtx_release()
+    exe = MEDIAMTX_DIR / exe_name
     if exe.exists():
         return exe
     MEDIAMTX_DIR.mkdir(exist_ok=True)
-    zip_path = MEDIAMTX_DIR / "mediamtx.zip"
-    print(f"[mediamtx] downloading v{MEDIAMTX_VERSION} from github...")
-    urllib.request.urlretrieve(MEDIAMTX_WIN_URL, zip_path)
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(MEDIAMTX_DIR)
-    zip_path.unlink(missing_ok=True)
+    archive_path = MEDIAMTX_DIR / archive_name
+    print(f"[mediamtx] downloading v{MEDIAMTX_VERSION} for {platform.system()} from github...")
+    urllib.request.urlretrieve(url, archive_path)
+    if archive_name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as z:
+            z.extractall(MEDIAMTX_DIR)
+    else:
+        with tarfile.open(archive_path, "r:gz") as t:
+            t.extractall(MEDIAMTX_DIR)
+    archive_path.unlink(missing_ok=True)
     if not exe.exists():
-        raise RuntimeError(f"mediamtx exe missing after extract: {exe}")
+        raise RuntimeError(f"mediamtx executable missing after extract: {exe}")
+    try:
+        exe.chmod(0o755)
+    except Exception:
+        pass
     return exe
 
 
-def start_mediamtx() -> subprocess.Popen:
+def _port_open(host: str, port: int, timeout: float = 0.4) -> bool:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _kill_stale_mediamtx() -> bool:
+    """SIGTERM any running mediamtx process. Returns True if any killed."""
+    killed = False
+    try:
+        out = subprocess.run(["pgrep", "-f", "mediamtx"], capture_output=True, text=True, timeout=2)
+        pids = [p for p in (out.stdout or "").split() if p.strip().isdigit()]
+        if pids:
+            subprocess.run(["kill", *pids], check=False)
+            time.sleep(0.7)
+            killed = True
+            print(f"[mediamtx] killed stale pids: {pids}")
+    except FileNotFoundError:
+        pass
+    return killed
+
+
+def start_mediamtx() -> subprocess.Popen | None:
+    """Start mediamtx. If RTMP :1935 already serving, reuse it (return None).
+    If a stale mediamtx blocks ports, kill it and retry once."""
+    if _port_open("127.0.0.1", 1935):
+        print("[mediamtx] RTMP 1935 already up; reusing existing server")
+        return None
     exe = ensure_mediamtx()
-    print(f"[mediamtx] starting {exe}")
-    proc = subprocess.Popen(
-        [str(exe)],
-        cwd=str(MEDIAMTX_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    # wait for "RTMP listener opened" or similar
+
+    def _spawn() -> subprocess.Popen:
+        print(f"[mediamtx] starting {exe}")
+        return subprocess.Popen(
+            [str(exe)],
+            cwd=str(MEDIAMTX_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    proc = _spawn()
     time.sleep(2.0)
     if proc.poll() is not None:
         out = proc.stdout.read() if proc.stdout else ""
-        raise RuntimeError(f"mediamtx died: {out}")
+        # one retry after killing stale mediamtx (port-conflict recovery)
+        if "address already in use" in out.lower() or "bind" in out.lower():
+            print("[mediamtx] port conflict; killing stale instance and retrying")
+            _kill_stale_mediamtx()
+            proc = _spawn()
+            time.sleep(2.0)
+        if proc.poll() is not None:
+            out2 = proc.stdout.read() if proc.stdout else ""
+            raise RuntimeError(f"mediamtx died:\nfirst:\n{out}\nretry:\n{out2}")
     print("[mediamtx] up: RTMP=1935 HLS=8888 WebRTC=8889 RTSP=8554")
     return proc
 
@@ -111,13 +190,14 @@ def _enable_torch_perf():
 
 
 def build_upscaler(args):
-    """Build realesrgan_lite w/ channels_last + torch.compile perf opts."""
+    """Build realesrgan_lite. channels_last + torch.compile applied inside RealESRGANLite.load()."""
     from src.models.base import UpscalerConfig, build  # type: ignore
-    from src.models._perf import apply_perf_opts  # type: ignore
+    compile_on = not args.no_compile
     extra = {
         "model_name": "realesr-general-x4v3",
         "denoise_strength": args.upscale_denoise,
         "tile": 0,
+        "compile": compile_on,
     }
     cfg = UpscalerConfig(
         name=args.upscale_model,
@@ -128,17 +208,11 @@ def build_upscaler(args):
     )
     up = build(cfg)
     up.load()
-    try:
-        up.upsampler.model = apply_perf_opts(
-            up.upsampler.model,
-            compile=not args.no_compile,
-            channels_last=True,
-            compile_mode="default",
-        )
-        print(f"[upscale] perf opts: channels_last=True compile={not args.no_compile}")
-    except Exception as e:
-        print(f"[upscale] apply_perf_opts skipped: {e}")
-    print(f"[upscale] loaded {args.upscale_model} scale={args.upscale_scale} dtype={args.upscale_dtype} denoise={args.upscale_denoise}")
+    print(
+        f"[upscale] loaded {args.upscale_model} scale={args.upscale_scale} "
+        f"dtype={args.upscale_dtype} denoise={args.upscale_denoise} "
+        f"channels_last=True compile={compile_on}"
+    )
     return up
 
 
@@ -165,9 +239,104 @@ def batched_esrgan_infer(rgan_obj, frames_bgr: np.ndarray, half: bool, device: s
     return np.ascontiguousarray(arr[..., ::-1])  # back to BGR
 
 
-def start_ffmpeg_pusher(width: int, height: int, fps: float, rtmp_url: str) -> subprocess.Popen:
+_NVENC_PROBE_RESULT: bool | None = None
+
+
+def _ffmpeg_has_nvenc() -> bool:
+    """Probe ffmpeg AND the GPU/driver for working h264_nvenc.
+
+    `ffmpeg -encoders` only tells us the encoder is compiled in -- it does
+    not tell us the device can open an NVENC session (Laptop GPUs without
+    NVENC silicon, missing driver bits, or hybrid-graphics setups all fail
+    at OpenEncodeSessionEx). We do a real 64x64 encode to confirm.
+    Cached after first call.
+    """
+    global _NVENC_PROBE_RESULT
+    if _NVENC_PROBE_RESULT is not None:
+        return _NVENC_PROBE_RESULT
+    try:
+        listed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if "h264_nvenc" not in (listed.stdout or ""):
+            _NVENC_PROBE_RESULT = False
+            return False
+        # Real session probe: try a 256x256x1-frame nullsrc encode.
+        # NVENC h264 min frame size is ~145x49 (Maxwell+); older 64x64 probe
+        # tripped "Frame Dimension less than the minimum supported value".
+        probe = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "nullsrc=s=256x256:r=15",
+                "-t", "0.1",
+                "-c:v", "h264_nvenc", "-preset", "p1",
+                "-pix_fmt", "yuv420p",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        ok = probe.returncode == 0 and "OpenEncodeSessionEx" not in (probe.stderr or "")
+        if not ok:
+            err = (probe.stderr or "").strip().splitlines()[:3]
+            print(f"[nvenc] probe failed -> libx264 fallback. ffmpeg said: {' | '.join(err) or 'no stderr'}")
+        _NVENC_PROBE_RESULT = ok
+        return ok
+    except Exception as e:
+        print(f"[nvenc] probe error -> libx264 fallback: {e}")
+        _NVENC_PROBE_RESULT = False
+        return False
+
+
+def start_ffmpeg_pusher(
+    width: int,
+    height: int,
+    fps: float,
+    rtmp_url: str,
+    encoder: str = "auto",
+    preset: str = "veryfast",
+    crf: int = 20,
+    bitrate: str | None = None,
+) -> subprocess.Popen:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found in PATH. Install ffmpeg first.")
+
+    if encoder == "auto":
+        encoder = "h264_nvenc" if _ffmpeg_has_nvenc() else "libx264"
+    elif encoder == "h264_nvenc" and not _ffmpeg_has_nvenc():
+        print("[ffmpeg] requested h264_nvenc but ffmpeg lacks it; falling back to libx264")
+        encoder = "libx264"
+
+    gop = str(max(2, int(fps)))
+    if encoder == "h264_nvenc":
+        # NVENC: prefer constqp w/ a quality target, or fall back to bitrate cap if user sets one.
+        venc = [
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",      # p1=fastest/worst, p7=slowest/best. p4 = balanced.
+            "-tune", "ll",
+            "-zerolatency", "1",
+            "-pix_fmt", "yuv420p",
+            "-g", gop,
+        ]
+        if bitrate:
+            venc += ["-rc", "cbr", "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate]
+        else:
+            venc += ["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+    else:
+        # libx264: CRF mode gives best quality-per-byte. veryfast preset balances CPU vs quality.
+        venc = [
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p",
+            "-g", gop,
+            "-keyint_min", gop,
+        ]
+        if bitrate:
+            venc += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate]
+        else:
+            venc += ["-crf", str(crf)]
+
     cmd = [
         "ffmpeg",
         "-loglevel", "warning",
@@ -178,20 +347,29 @@ def start_ffmpeg_pusher(width: int, height: int, fps: float, rtmp_url: str) -> s
         "-s", f"{width}x{height}",
         "-r", f"{fps}",
         "-i", "-",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p",
-        "-g", str(max(2, int(fps))),
-        "-keyint_min", str(max(2, int(fps))),
-        "-b:v", "2M",
-        "-maxrate", "2M",
-        "-bufsize", "1M",
+        *venc,
         "-f", "flv",
         rtmp_url,
     ]
-    print(f"[ffmpeg] push -> {rtmp_url}")
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"[ffmpeg] push -> {rtmp_url} encoder={encoder} input={width}x{height}@{fps:.1f}")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    # Drain stderr so the pipe doesn't fill + so we can see WHY ffmpeg dies.
+    def _drain_stderr(p):
+        try:
+            for raw in iter(p.stderr.readline, b""):
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    print(f"[ffmpeg] {line}", flush=True)
+        except Exception:
+            pass
+    threading.Thread(target=_drain_stderr, args=(proc,), daemon=True).start()
+    return proc
 
 
 @dataclass
@@ -368,15 +546,50 @@ def upscale_worker(
 ):
     """Batch-pull from mid_q, native batched ESRGAN forward, push to out_q."""
     batch_size = args.upscale_batch
-    batch_timeout = args.upscale_batch_timeout / 1000.0
     pre = args.upscale_pre_resize
     half = args.upscale_dtype == "fp16"
 
+    # ---- adaptive batch-timeout state ----
+    # If user passed a positive value, honor it as a fixed timeout.
+    # Otherwise (default 0), derive from observed inter-arrival via EMA.
+    use_adaptive = args.upscale_batch_timeout <= 0.0
+    fixed_timeout_s = (args.upscale_batch_timeout / 1000.0) if not use_adaptive else None
+    ema_dt = 1.0 / 25.0       # bootstrap: assume 25 fps source
+    ema_alpha = 0.1
+    last_arrival = None
+    safety = 1.2
+    min_timeout_s = 0.005
+    max_timeout_s = 0.200
+    last_log_t = 0.0
+
+    def _record_arrival():
+        nonlocal last_arrival, ema_dt
+        now = time.time()
+        if last_arrival is not None:
+            dt = now - last_arrival
+            if 0.001 < dt < 1.0:
+                ema_dt = (1.0 - ema_alpha) * ema_dt + ema_alpha * dt
+        last_arrival = now
+
+    def _current_timeout_s() -> float:
+        if not use_adaptive:
+            return fixed_timeout_s  # type: ignore[return-value]
+        t = batch_size * ema_dt * safety
+        return max(min_timeout_s, min(max_timeout_s, t))
+
+    if use_adaptive:
+        print(f"[upscale] batch_timeout=adaptive (clamped {min_timeout_s*1000:.0f}-{max_timeout_s*1000:.0f}ms, "
+              f"safety={safety}, bootstrap fps=25)")
+    else:
+        print(f"[upscale] batch_timeout=fixed {fixed_timeout_s*1000:.1f}ms (user override)")
+
     while not stop_event.is_set():
+        timeout_s = _current_timeout_s()
         batch: list[OutItem] = []
-        deadline = time.time() + batch_timeout
+        deadline = time.time() + timeout_s
         try:
             batch.append(mid_q.get(timeout=0.1))
+            _record_arrival()
         except queue.Empty:
             continue
         while len(batch) < batch_size:
@@ -385,8 +598,16 @@ def upscale_worker(
                 break
             try:
                 batch.append(mid_q.get(timeout=remaining))
+                _record_arrival()
             except queue.Empty:
                 break
+
+        # periodic visibility into adaptive state (every ~5s)
+        if use_adaptive and (time.time() - last_log_t) > 5.0:
+            last_log_t = time.time()
+            fps_est = 1.0 / max(ema_dt, 1e-6)
+            print(f"[upscale] adaptive timeout={timeout_s*1000:.0f}ms  "
+                  f"observed_fps~{fps_est:.1f}  last_batch={len(batch)}/{batch_size}")
 
         # pre-resize all frames to common (h, w)
         if pre and abs(pre - 1.0) > 1e-3:
@@ -434,13 +655,13 @@ def main() -> int:
     # stream (defaults preloaded for dev)
     ap.add_argument("--username", default="m.alawneh")
     ap.add_argument("--password", default="sgQZ9Oou3CsP")
-    ap.add_argument("--imei", default="867395071670570")
+    ap.add_argument("--imei", default="867395071670570") # 867395071656363
     ap.add_argument("--cam-id", type=int, default=4)
     ap.add_argument("--duration", type=int, default=30)
     ap.add_argument("--stream-type", default="sub", choices=["sub", "main"])
     ap.add_argument("--live", action="store_true", default=True)
     # pipeline
-    ap.add_argument("--batch", type=int, default=4, help="frames per detector batch")
+    ap.add_argument("--batch", type=int, default=16, help="frames per detector batch") #### Asem 
     ap.add_argument("--batch-timeout", type=float, default=15.0, help="ms to wait filling batch")
     ap.add_argument("--capture-q-size", type=int, default=16)
     ap.add_argument("--out-q-size", type=int, default=16)
@@ -448,17 +669,25 @@ def main() -> int:
     # service selector
     ap.add_argument("--service", choices=["blur", "upscale", "both"], default="blur",
                     help="blur=face-blur only, upscale=ESRGAN only, both=blur then upscale")
-    # upscaler defaults (tested best for realesrgan_lite per user)
+     ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ############################################################## ##############################################################                
+    # upscaler defaults (tested best for realesrgan_lite per user) ##############################################################
     ap.add_argument("--upscale-model", default="realesrgan_lite")
-    ap.add_argument("--upscale-scale", type=int, default=4)
-    ap.add_argument("--upscale-pre-resize", type=float, default=0.8, help="pre-resize ratio (0.8 = 80%)")
+    ap.add_argument("--upscale-scale", type=int, default=4, choices=[2, 4],
+                    help="effective output scale. model is hardcoded 4x; "
+                         "scale=2 auto-halves --upscale-pre-resize so net output is 2x")
+    ap.add_argument("--upscale-pre-resize", type=float, default=0.8,
+                    help="pre-resize ratio applied BEFORE SR (0.8 = shrink to 80 percent). "
+                         "Combined w/ --upscale-scale to compute net scale = 4 * pre_resize")
     ap.add_argument("--upscale-dtype", choices=["fp16"], default="fp16")
-    ap.add_argument("--compile", dest="no_compile", action="store_false", help="enable torch.compile (needs triton)")
-    ap.add_argument("--no-compile", action="store_true", default=True, help="disable torch.compile (default; triton missing on Win)")
-    ap.add_argument("--upscale-batch", type=int, default=4, help="frames per upscale GPU batch")
-    ap.add_argument("--upscale-batch-timeout", type=float, default=15.0, help="ms to wait filling upscale batch")
+    ap.add_argument("--no-compile", action="store_true", default=False,
+                    help="disable torch.compile (set on Windows where triton may be missing)")
+    ap.add_argument("--upscale-batch", type=int, default=2, help="frames per upscale GPU batch")
+    ap.add_argument("--upscale-batch-timeout", type=float, default=0.0,
+                    help="ms to wait filling upscale batch. 0=adaptive: timeout = batch_size / observed_fps * 1.2, "
+                         "clamped [5..200] ms. Pass positive number to force a fixed timeout")
     ap.add_argument("--mid-q-size", type=int, default=16, help="queue between blur and upscale workers")
-    ap.add_argument("--upscale-denoise", type=float, default=1.0, help="esrgan denoise strength 0..1")
+    ap.add_argument("--upscale-denoise", type=float, default=0, help="esrgan denoise strength 0..1") 
+     ############################################################## ############################################################## ############################################################## ############################################################## ##############################################################
     # detector
     ap.add_argument("--detector", choices=["retinaface", "yolo"], default="retinaface")
     ap.add_argument("--retinaface-net", choices=["resnet50", "mobilenet"], default="resnet50")
@@ -481,15 +710,56 @@ def main() -> int:
     ap.add_argument("--exclude-roi", default=None)
     ap.add_argument("--driver-side", default=None, choices=["left", "right"])
     # output
-    ap.add_argument("--display", action="store_true", help="show blurred output window")
+    ap.add_argument("--display", action="store_true", help="show output window")
+    ap.add_argument("--display-scale", type=float, default=1.0,
+                    help="shrink factor for --display window (0.35 = 35 percent of SR frame; full SR is too big)")
+    ap.add_argument("--display-max-w", type=int, default=1600,
+                    help="hard cap on display window width in pixels (downscale if larger)")
     ap.add_argument("--show-raw", action="store_true", help="also show raw NodePlayer window")
     ap.add_argument("--rtmp-url", default="rtmp://localhost:1935/blur", help="RTMP push URL")
     ap.add_argument("--no-rtmp", action="store_true", help="disable RTMP push")
     ap.add_argument("--start-server", action="store_true", default=True, help="auto-launch mediamtx local server")
     ap.add_argument("--no-server", dest="start_server", action="store_false")
     ap.add_argument("--push-fps", type=float, default=15.0, help="RTMP encode fps (lower = less CPU)")
+    ap.add_argument("--decode-fps", type=float, default=0.0,
+                    help="cap ffmpeg WS decoder output fps. 0=auto (match --push-fps). Lower = fewer frames"
+                         " entering pipeline = more consecutive frames, less queue churn.")
+    ap.add_argument("--queue-size", type=int, default=8,
+                    help="NodePlayer.frame_queue maxsize. Small keeps frames fresh, large absorbs jitter.")
+    ap.add_argument("--push-max-w", type=int, default=0,
+                    help="cap RTMP push width (downscale SR frame before push). 0=disable. NVENC on Laptop GPUs"
+                         " often refuses >3840 wide; default 1920 keeps things sane")
+    ap.add_argument("--encoder", choices=["auto", "h264_nvenc", "libx264"], default="auto",
+                    help="ffmpeg video encoder. auto picks h264_nvenc when available, else libx264")
+    ap.add_argument("--x264-preset", default="veryfast",
+                    choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
+                    help="libx264 preset. ultrafast=lowest CPU / worst quality, medium=best quality / most CPU. "
+                         "veryfast = good live balance")
+    ap.add_argument("--push-crf", type=int, default=20,
+                    help="x264/NVENC quality target (18=visually lossless, 23=x264 default, 28=lossy). "
+                         "Lower = better quality + bigger stream")
+    ap.add_argument("--push-bitrate", default=None,
+                    help="force constant bitrate cap (e.g. 6M, 10M). Overrides --push-crf. Useful when bandwidth-limited")
     ap.add_argument("--report-every", type=int, default=30, help="latency report every N processed frames")
+    ap.add_argument("--debug-log", default=None,
+                    help="write per-frame timing CSV to this path. Columns: "
+                         "seq,capture_ts,enqueue_ts,detect_start,detect_end,post_end,upscale_end,"
+                         "consume_ts,qwait_ms,detect_ms,post_ms,upscale_ms,e2e_ms,n_faces,ooo_flag")
+    ap.add_argument("--debug-decode", action="store_true",
+                    help="have NodePlayer log frame_count + temp-file POS every 30 emits (debug FLV replay)")
     args = ap.parse_args()
+
+    # Resolve --upscale-scale: model is hardcoded 4x.
+    # scale=2 means we halve pre-resize so net = 4x * (pre/2) = 2x effective.
+    # scale=4 keeps pre-resize as-is so net = 4x * pre.
+    NATIVE_SCALE = 4
+    if args.upscale_scale == 2:
+        args.upscale_pre_resize *= 0.5
+    effective_scale = NATIVE_SCALE * args.upscale_pre_resize
+    print(
+        f"[upscale] scale_choice={args.upscale_scale}x  native=4x  "
+        f"pre_resize={args.upscale_pre_resize:.3f}  -> effective ~{effective_scale:.2f}x"
+    )
 
     _enable_torch_perf()
     if torch.cuda.is_available():
@@ -528,8 +798,13 @@ def main() -> int:
     out_q: queue.Queue = queue.Queue(maxsize=args.out_q_size)
     stop_event = threading.Event()
 
-    # NOTE: NodePlayer fills frame_queue ONLY when show_video=True (decoder thread).
-    # We force it ON, then suppress cv2.imshow so no raw window pops up.
+    # NodePlayer fills frame_queue only when show_video=True (decoder thread).
+    # Force it ON, then suppress cv2.imshow so no raw window pops up.
+    # Also suppress cv2.waitKey from non-main threads -- Qt timers cannot be
+    # started off the main thread, and NodePlayer's display thread calls
+    # cv2.waitKey(1) every iter. Without this guard we get
+    # "QObject::startTimer: Timers cannot be started from another thread"
+    # spam and a segfault on shutdown.
     if not args.show_raw:
         _orig_imshow = cv2.imshow
         _orig_waitkey = cv2.waitKey
@@ -537,10 +812,14 @@ def main() -> int:
             if win == "NodePlayer":
                 return
             _orig_imshow(win, img)
-        def _waitkey_noop(d):
-            return _orig_waitkey(d) if d > 0 else -1
+        def _waitkey_main_only(d):
+            if threading.current_thread() is threading.main_thread():
+                return _orig_waitkey(d)
+            return -1
         cv2.imshow = _imshow_noop  # type: ignore
+        cv2.waitKey = _waitkey_main_only  # type: ignore
 
+    decode_fps = args.decode_fps if args.decode_fps > 0 else args.push_fps
     player = NodePlayer(
         username=args.username,
         password=args.password,
@@ -550,7 +829,11 @@ def main() -> int:
         live_stream=args.live,
         stream_type=args.stream_type,
         show_video=True,
+        debug_decode=args.debug_decode,
+        decode_fps=decode_fps,
+        queue_maxsize=args.queue_size,
     )
+    print(f"[ws] decode_fps={decode_fps:.1f} queue_maxsize={args.queue_size}")
 
     cap_t = threading.Thread(
         target=capture_thread,
@@ -593,6 +876,8 @@ def main() -> int:
         up_t.start()
         print(f"[pipeline] upscale worker batch={args.upscale_batch} timeout={args.upscale_batch_timeout}ms")
 
+    _display_win_init = {"done": False}
+
     # latency stats
     lat_e2e: list[float] = []
     lat_qwait: list[float] = []
@@ -603,6 +888,18 @@ def main() -> int:
     n_processed = 0
     t_first = None
     last_report = time.time()
+
+    # ---- debug instrumentation ----
+    debug_fh = None
+    if args.debug_log:
+        debug_fh = open(args.debug_log, "w", buffering=1)  # line-buffered for tail-f
+        debug_fh.write(
+            "seq,capture_ts,enqueue_ts,detect_start,detect_end,post_end,upscale_end,"
+            "consume_ts,qwait_ms,detect_ms,post_ms,upscale_ms,e2e_ms,n_faces,ooo_flag\n"
+        )
+        print(f"[debug] per-frame timeline -> {args.debug_log}")
+    last_seq = -1
+    ooo_count = 0
 
     try:
         while not stop_event.is_set() or not out_q.empty():
@@ -629,6 +926,25 @@ def main() -> int:
             upscale_ms = (item.upscale_end_ts - item.post_end_ts) * 1000
             e2e_ms = (now - item.capture_ts) * 1000
 
+            # out-of-order detector: pipeline should emit increasing seq.
+            # Any decrease = either NodePlayer replayed (cap reopened mid-stream)
+            # or batch reordering. Either is a bug worth knowing about.
+            ooo = item.seq < last_seq
+            if ooo:
+                ooo_count += 1
+                if ooo_count <= 20:  # cap log spam
+                    print(f"[OOO] frame seq={item.seq} arrived after last_seq={last_seq} (count={ooo_count})", flush=True)
+            last_seq = max(last_seq, item.seq)
+
+            if debug_fh is not None:
+                debug_fh.write(
+                    f"{item.seq},{item.capture_ts:.6f},{item.enqueue_ts:.6f},"
+                    f"{item.detect_start_ts:.6f},{item.detect_end_ts:.6f},"
+                    f"{item.post_end_ts:.6f},{item.upscale_end_ts:.6f},"
+                    f"{now:.6f},{qwait_ms:.2f},{detect_ms:.2f},{post_ms:.2f},"
+                    f"{upscale_ms:.2f},{e2e_ms:.2f},{item.n_faces},{int(ooo)}\n"
+                )
+
             lat_qwait.append(qwait_ms)
             lat_detect.append(detect_ms)
             lat_post.append(post_ms)
@@ -640,9 +956,22 @@ def main() -> int:
             # init ffmpeg on first frame
             if ffmpeg_proc is None and not args.no_rtmp:
                 fh, fw = item.frame.shape[:2]
+                # Downscale SR frame before push: NVENC on Laptop GPUs often refuses
+                # >3840 wide, and 4096x2304 H.264 burns NVENC sessions anyway.
+                if args.push_max_w > 0 and fw > args.push_max_w:
+                    ratio = args.push_max_w / float(fw)
+                    fw = args.push_max_w
+                    fh = int(fh * ratio) & ~1  # keep even (yuv420p requires)
+                    print(f"[ffmpeg] downscaling SR -> {fw}x{fh} for push (--push-max-w)")
                 push_dims = (fw, fh)
                 try:
-                    ffmpeg_proc = start_ffmpeg_pusher(fw, fh, args.push_fps, args.rtmp_url)
+                    ffmpeg_proc = start_ffmpeg_pusher(
+                        fw, fh, args.push_fps, args.rtmp_url,
+                        encoder=args.encoder,
+                        preset=args.x264_preset,
+                        crf=args.push_crf,
+                        bitrate=args.push_bitrate,
+                    )
                     print(f"\n=== STREAM URLS  (push res {fw}x{fh}) ===")
                     print(f"  RTMP  : {args.rtmp_url}")
                     print(f"  HLS   : http://localhost:8888/{push_path}/index.m3u8")
@@ -667,7 +996,22 @@ def main() -> int:
                     args.no_rtmp = True
 
             if args.display:
-                cv2.imshow("blur-live", item.frame)
+                disp = item.frame
+                fh, fw = disp.shape[:2]
+                scale = args.display_scale if args.display_scale > 0 else 1.0
+                tw = int(fw * scale)
+                th = int(fh * scale)
+                if args.display_max_w > 0 and tw > args.display_max_w:
+                    r = args.display_max_w / float(tw)
+                    tw = args.display_max_w
+                    th = int(th * r)
+                if (tw, th) != (fw, fh):
+                    disp = cv2.resize(disp, (tw, th), interpolation=cv2.INTER_AREA)
+                if not _display_win_init["done"]:
+                    cv2.namedWindow("blur-live", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("blur-live", tw, th)
+                    _display_win_init["done"] = True
+                cv2.imshow("blur-live", disp)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     stop_event.set()
                     break
@@ -749,6 +1093,13 @@ def main() -> int:
     headroom = (budget - e2e.mean()) / budget * 100
     verdict = "REALTIME ✓" if e2e.mean() <= budget else "OVER BUDGET ✗"
     print(f"  assuming {src_fps_assumed:.0f}fps source: budget={budget:.1f}ms, headroom={headroom:+.1f}% -> {verdict}")
+    print(f"  out-of-order frames: {ooo_count} (frames whose seq < previous seq)")
+    if debug_fh is not None:
+        try:
+            debug_fh.close()
+            print(f"  debug-log written: {args.debug_log}")
+        except Exception:
+            pass
     return 0
 
 

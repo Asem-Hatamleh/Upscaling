@@ -44,6 +44,13 @@ __MACOSX/
 # Logs
 *.log
 nohup.out
+terminal.txt
 
 # gfpgan stashes facexlib weights here when run via the bg_upsampler path
 gfpgan/weights/
+
+# pipeline_live.py runtime artifacts
+# bin/        — auto-downloaded mediamtx binary
+# recordings/ — raw FLV captures from LiveFeeder
+bin/
+recordings/

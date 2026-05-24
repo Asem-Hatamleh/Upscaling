@@ -71,9 +71,10 @@ def batched_realesrganer_enhance(
     ``frames_rgb``: (N, H, W, 3) uint8 RGB.
     Returns:     (N, H*scale, W*scale, 3) uint8 RGB.
 
-    Preprocessing replicates ``RealESRGANer.enhance``:
+    Preprocessing replicates ``RealESRGANer.enhance`` (which internally
+    runs ``cvtColor(BGR2RGB)`` before the model forward, so the model
+    sees and outputs RGB tensors):
 
-    - RGB -> BGR (RealESRGAN's training input ordering matches cv2)
     - permute HWC -> CHW, add batch
     - cast to fp16 (or fp32) and divide by 255
     - reflect-pad H/W to multiple of ``mod_pad`` (default 2, same as
@@ -81,7 +82,6 @@ def batched_realesrganer_enhance(
     - forward through ``upsampler.model``
     - crop output by ``pad * scale``
     - clamp, *255, uint8, permute back to HWC
-    - BGR -> RGB
 
     The DNI denoise blend (when ``0 < denoise < 1`` for x4v3) is baked
     into ``upsampler.model`` at load time, so we only need a single
@@ -90,11 +90,8 @@ def batched_realesrganer_enhance(
     """
     import torch
 
-    # RGB -> BGR by view-flip; ascontiguousarray forces the copy so the
-    # downstream torch tensor is contiguous and torch.from_numpy doesn't
-    # complain about negative strides.
-    bgr = np.ascontiguousarray(frames_rgb[..., ::-1])
-    t = torch.from_numpy(bgr).to(device, non_blocking=True)
+    rgb = np.ascontiguousarray(frames_rgb)
+    t = torch.from_numpy(rgb).to(device, non_blocking=True)
     t = t.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)
     t = t.half() if half else t.float()
     t = t / 255.0
@@ -113,5 +110,4 @@ def batched_realesrganer_enhance(
 
     sr = sr.clamp(0, 1).mul(255.0).to(torch.uint8)
     sr = sr.permute(0, 2, 3, 1).contiguous()
-    arr = sr.cpu().numpy()
-    return np.ascontiguousarray(arr[..., ::-1])  # BGR -> RGB
+    return sr.cpu().numpy()

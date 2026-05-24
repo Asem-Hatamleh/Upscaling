@@ -207,4 +207,209 @@ single file + one import in `src/models/__init__.py`.
 ## 7. Contact / repo
 
 GitHub: <https://github.com/Asem-Hatamleh/Upscaling>
+
+---
+
+## 8. FullPipeline branch — live-streaming SR pipeline (2026-05-24)
+
+This section covers work done on the `FullPipeline` branch on top of
+`realesrgan-lite`. Goal: pull a live WebSocket FLV stream from an Iotistic
+MNVR IP camera, run Real-ESRGAN Lite (SR-only mode), push the processed
+stream out via mediamtx for RTMP / HLS / WebRTC / RTSP playback.
+
+### 8.1 Files
+
+| File | Purpose |
+|---|---|
+| `pipeline_live.py` | Main entrypoint. Threaded capture → detect → upscale → ffmpeg push pipeline. |
+| `blur_faces.py` | Face-blur module (RetinaFace / YOLO + GhostTracker). Used only when `--service blur` or `both`. |
+| `LiveFeeder.py` | `NodePlayer`: auth to Iotistic API, opens WS/HLS stream, decodes via cv2 to `frame_queue`. |
+| `bin/mediamtx*` | mediamtx binary (auto-downloaded on first run). |
+| `src/models/realesrgan_lite.py` | SR model wrapper (channels_last + torch.compile applied at load). |
+| `src/models/_perf.py` | `apply_perf_opts`, `batched_realesrganer_enhance` (offline path). |
+
+### 8.2 Architecture
+
+```
+[NodePlayer ws://...flv -> growing temp file]
+    -> [_display_loop: cv2.VideoCapture decode -> frame_queue (maxsize 300)]
+        -> [capture_thread: drop-oldest -> capture_q (16)]
+            -> [detect_worker: batched; no-op when --service upscale]
+                -> [upscale_worker: batched SR -> out_q (16)]
+                    -> [main: imshow + ffmpeg pipe + RTMP push]
+                            -> [mediamtx 1935/8888/8889/8554]
+```
+
+### 8.3 Known issues & decisions
+
+1. **NodePlayer decode is fragile**. `_display_loop` runs `cv2.VideoCapture`
+   on a growing FLV temp file written by the WS receiver. After ~2 s of
+   stalled reads we release + reopen the cap; cv2 then restarts at byte 0
+   of the file. We **seek** to `frames_emitted - 1` after reopen and also
+   skip frames whose reported `CAP_PROP_POS_FRAMES` is ≤ `frame_count` to
+   absorb replays. Still occasional micro-replay possible on FLV. A real
+   fix is to bypass NodePlayer's temp-file design and pipe WS bytes
+   directly into an ffmpeg subprocess (`-i pipe:0 -f rawvideo`). Not done.
+2. **NVENC unavailable on RTX 5050 Laptop**. The GPU lists `h264_nvenc`
+   via `ffmpeg -encoders` but `OpenEncodeSessionEx` returns `unsupported
+   device (2)`. `_ffmpeg_has_nvenc()` now does a **real** 64×64 test encode
+   and caches the result; falls back to `libx264`.
+3. **`--upscale-scale` was cosmetic**. Model arch (`SRVGGNetCompact upscale=4`)
+   is hardcoded 4×. Now restricted to `{2, 4}`: `2` auto-halves
+   `--upscale-pre-resize` for effective 2× net scale.
+4. **Adaptive batch timeout**. `--upscale-batch-timeout 0` (default) →
+   worker tracks inter-arrival EMA, computes
+   `timeout = batch_size * ema_dt * 1.2`, clamped `[5 ms, 200 ms]`.
+   Pass positive ms to force fixed.
+5. **Big batches hurt live**. batch=16 with 25 fps source = 640 ms to fill
+   → e2e ≥ 1 s before SR even starts. Default is `--upscale-batch 4`.
+   Per-frame throughput is the same; latency much better.
+6. **Push downscale removed by default**. `--push-max-w 0` = no downscale
+   before ffmpeg. Earlier default 1920 was hiding SR detail from browser.
+7. **libx264 quality bumped**. `ultrafast` → `veryfast`, bitrate-cap-2M
+   → CRF 20. Encode CPU +~5–10 ms/frame; quality much better at the
+   same wire bitrate.
+8. **Qt cross-thread crash fixed**. NodePlayer's `_display_loop` no longer
+   calls `cv2.imshow` / `cv2.waitKey`. `pipeline_live.main` overrides
+   `cv2.waitKey` so any leftover background call returns `-1` instead of
+   touching a Qt timer (which segfaults).
+9. **mediamtx stale-instance handling**. `start_mediamtx` probes `:1935`
+   first; if already serving, reuses. If new launch fails with
+   `address already in use`, kills stale pids via pgrep + retries once.
+10. **_perf.batched_realesrganer_enhance had wrong channel order** for
+    the offline path. RealESRGAN's `enhance()` does
+    `cvtColor(BGR2RGB)` before the model, so the net is trained on RGB.
+    The old helper flipped twice (RGB→BGR before, BGR→RGB after); now
+    feeds RGB directly. Offline outputs may shift slightly from prior
+    `realesrgan-lite` branch runs — visually similar but not bit-exact.
+
+### 8.4 Debugging
+
+Two flags added:
+
+- `--debug-log /tmp/sr_timeline.csv` — per-frame CSV (seq, all stage
+  timestamps, latencies, n_faces, ooo_flag). Append-only, line-buffered.
+- `--debug-decode` — NodePlayer logs `[decode] emit#N pos=N temp_file=...
+  qsize=...` every 30 emits.
+
+Useful analysis snippets in §8.5.
+
+### 8.5 Triage runbook for the live pipeline
+
+| Symptom | Check | Likely cause |
+|---|---|---|
+| "stream not found" in browser/VLC | watch `[ffmpeg]` stderr at start | NVENC failed; libx264 fallback didn't kick in |
+| `pipe broken` early | same | ffmpeg died — read `[ffmpeg] [...]` lines |
+| `cap is none, waiting` forever | initial `Packet mismatch` count | stream too lossy, raise `initial_buffer_bytes` in `_display_loop` |
+| "going backward" feel | `awk -F, '$15==1' /tmp/sr_timeline.csv \| wc -l` | OOO inside pipeline — should be 0; if > 0, NodePlayer cap-reopen issue |
+| e2e > 3 s | `awk -F, 'NR>1 {sum+=$13;n++} END {print sum/n}'` | batch too big; lower `--upscale-batch` |
+| seq gaps > 50 | `awk -F, 'NR<2{next} NR==2{p=$1;next} $1-p>1{print p"->"$1}'` | drop-oldest discarding source faster than SR; expected on RTX 5050 Laptop @ 4× SR |
+| Qt segfault | run with `--no-display`, view via RTSP / WebRTC | Qt thread bug, missing `_waitkey_main_only` patch |
+
+### 8.6 Recommended live config (RTX 5050 Laptop)
+
+```
+python pipeline_live.py --service upscale \
+  --upscale-batch 2 --upscale-batch-timeout 0 \
+  --upscale-pre-resize 0.8 --upscale-scale 4 \
+  --upscale-denoise 0.3 \
+  --push-max-w 0 --x264-preset veryfast --push-crf 20 \
+  --display --display-scale 0.5
+```
+
+This is the configuration that converged in the 2026-05-24 debugging
+session. Trade-offs:
+- ~7 fps effective; e2e ~1.5 s. Not real-time but acceptable for
+  monitoring on this GPU.
+- Source feeds ~8 fps from sub stream — pipeline keeps up.
+- batch=2 keeps torch.compile shape cache hot.
+
+### 8.7 Next steps for this branch
+
+1. **Replace NodePlayer's temp-file decode with a piped ffmpeg subprocess**
+   (most robust fix to lingering replay micro-jitter; the cv2 / growing-FLV
+   design is fundamentally racy). Sketch: WS bytes → `ffmpeg.stdin`; read
+   raw `bgr24` frames from `ffmpeg.stdout` based on width/height parsed
+   from stderr.
+2. **Add `--upscale-stride N`** to drop every other (or every Nth)
+   source frame deliberately rather than relying on drop-oldest. Smoother
+   output at high source rates.
+3. **CRF 18 + medium preset on the production A100**. Latency budget
+   there easily handles it.
+4. **Move authentication out of CLI defaults**. `m.alawneh` / pwd
+   currently hardcoded in argparse. Pull from env vars.
+5. **Optional: PyAV-based decoder + encoder** to avoid the
+   ffmpeg-subprocess round trip entirely.
+
+### 8.8 Latest measured run (2026-05-24 12:07, RTX 5050 Laptop, sub stream)
+
+`python pipeline_live.py --service upscale --debug-log /tmp/sr_timeline.csv --debug-decode`
+
+```
+frames processed : 641
+out-of-order     : 0
+mean qwait_ms    : 307
+mean upscale_ms  : 2794   (batch=16 default at the time -> very high)
+mean e2e_ms      : 3295
+max  e2e_ms      : 6385
+source seq skipped: 1323  (drop-oldest -> ~67% of source frames discarded)
+```
+
+These numbers are from the *pre-fix* configuration. After applying §8.6
+config, expect `upscale_ms` to drop to ~400 ms, `e2e_ms` to ~700 ms.
+
+### 8.9 Pipeline rework (2026-05-24, later)
+
+Three issues from the §8.8 run were addressed:
+
+1. **NVENC probe (`[h264_nvenc] InitializeEncoder failed: invalid param (8):
+   Frame Dimension less than the minimum supported value.`)** — the old
+   probe used `nullsrc=s=64x64`, below the NVENC h264 minimum (~145×49 on
+   Maxwell+). Probe now uses `s=256x256:r=15` + `-pix_fmt yuv420p`. RTX 5050
+   Laptop now selects `h264_nvenc` instead of falling back to `libx264`.
+   See `pipeline_live.py:_ffmpeg_has_nvenc`.
+
+2. **FLV `Packet mismatch ... 11 ...` flood + `error while decoding MB`
+   spam** — the source FLV gateway emits bogus `PreviousTagSize` fields;
+   `cv2.VideoCapture` had no way to ignore them and produced thousands of
+   resync errors, silent frame drops, and visible decoder MB corruption.
+   Replaced the cv2-on-growing-tempfile decoder with an ffmpeg subprocess:
+
+   ```python
+   ffmpeg -hide_banner -loglevel info
+          -fflags +discardcorrupt+genpts -err_detect ignore_err
+          -f flv -i pipe:0 -map 0:v:0 -an
+          [-vsync cfr -r <decode_fps>]
+          -f rawvideo -pix_fmt bgr24 pipe:1
+   ```
+
+   WS bytes go to ffmpeg's stdin; stderr is parsed for the
+   `Stream … Video: …, WxH` line; stdout reader reads `W*H*3` bytes per
+   frame, reshapes to numpy BGR, and pushes to `player.frame_queue`.
+   Implementation: `LiveFeeder._save_and_show_video_ws`. `_FlvAligner`
+   (a tag-boundary buffer added earlier in the session) was removed —
+   the alignment was unnecessary once ffmpeg replaced cv2, since ffmpeg
+   resyncs internally.
+
+3. **Jerky motion from ffmpeg outpacing pipeline** — ffmpeg decode now
+   delivers ~28 fps, pipeline sustains ~8 fps; `frame_queue` evicted
+   ~75% of frames with drop-oldest. Added `-vsync cfr -r <decode_fps>`
+   so ffmpeg drops evenly at source rate. Also shrunk `frame_queue` from
+   300 → 8 to keep frames fresh. Exposed via two new CLI flags:
+
+   - `--decode-fps N` (default = `--push-fps` = 15). Set to ≈ pipeline
+     sustainable fps (8 on RTX 5050 @ 4×).
+   - `--queue-size N` (default 8).
+
+   Wired in `pipeline_live.py:817-832` (NodePlayer init) and
+   `LiveFeeder.py:36-43, 354-362` (ffmpeg cmd build).
+
+`requirements-pipeline.txt` now declares the previously-implicit
+`websockets`, `pytz`, `requests` deps. `numpy` was already pulled in by
+SR stack but is now used directly by `LiveFeeder._stdout_reader`.
+
+Files touched: `pipeline_live.py`, `LiveFeeder.py`,
+`requirements-pipeline.txt`, `README.md` (§7 rewrite), `.gitignore`
+(`bin/`, `recordings/`, `terminal.txt`).
+
 Owner: Asem Hatamleh (Acacus Group) — `a.hattamleh@acacusgroup.com`
