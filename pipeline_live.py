@@ -366,6 +366,7 @@ class FrameItem:
     seq: int
     upscale_start_ts: float = 0.0
     upscale_end_ts: float = 0.0
+    face_ms: float = 0.0
 
 
 def capture_thread(
@@ -445,8 +446,14 @@ def upscale_worker(
     stop_event: threading.Event,
     args,
     device: str,
+    face_enhancer=None,
 ):
-    """Batch-pull from capture_q, run Real-ESRGAN forward, push to out_q."""
+    """Batch-pull from capture_q, run Real-ESRGAN forward, push to out_q.
+
+    If ``face_enhancer`` is supplied, each SR frame is passed through it
+    after the batch forward to detect+restore faces. Face restoration is
+    per-frame (not batched) because facexlib's detector is per-image.
+    """
     batch_size = args.upscale_batch
     pre = args.upscale_pre_resize
     half = args.upscale_dtype == "fp16"
@@ -534,6 +541,16 @@ def upscale_worker(
             outs = [it.frame for it in batch]
 
         ts_end = time.time()
+
+        # face restoration runs AFTER SR (operates on hi-res output); cost
+        # tracked per-frame because detector is per-image.
+        if face_enhancer is not None:
+            for i, it in enumerate(batch):
+                t0 = time.time()
+                outs[i] = face_enhancer.restore(outs[i])
+                it.face_ms = (time.time() - t0) * 1000.0
+            ts_end = time.time()
+
         for it, sr in zip(batch, outs):
             it.frame = sr
             it.upscale_end_ts = ts_end
@@ -558,7 +575,7 @@ def main() -> int:
     ap.add_argument("--password", default="sgQZ9Oou3CsP")
     ap.add_argument("--imei", default="867395071670570")
     ap.add_argument("--cam-id", type=int, default=4)
-    ap.add_argument("--duration", type=int, default=300)
+    ap.add_argument("--duration", type=int, default=30)
     ap.add_argument("--stream-type", default="sub", choices=["sub", "main"])
     ap.add_argument("--live", action="store_true", default=True)
     # pipeline queues
@@ -614,6 +631,19 @@ def main() -> int:
                          "Lower = better quality + bigger stream")
     ap.add_argument("--push-bitrate", default=None,
                     help="force constant bitrate cap (e.g. 6M, 10M). Overrides --push-crf.")
+    # face enhancement (off by default; opt-in per run, like --target-latency)
+    ap.add_argument("--face-enhance", choices=["none", "gfpgan", "codeformer"], default="none",
+                    help="OPT-IN face restoration applied AFTER Real-ESRGAN. "
+                         "gfpgan = GFPGAN v1.4 (fast, less identity drift). "
+                         "codeformer = CodeFormer (slower, higher quality, --face-fidelity tunes "
+                         "quality<->identity). none (default) = disabled.")
+    ap.add_argument("--face-fidelity", type=float, default=0.5,
+                    help="Restoration weight 0..1. CodeFormer: 0=max quality (more identity drift), "
+                         "1=max identity preservation (less aggressive restore). GFPGAN: blend weight "
+                         "of restored vs original face. Typical 0.5-0.7.")
+    ap.add_argument("--face-only-center", action="store_true",
+                    help="restore only the center-most detected face per frame (faster when many "
+                         "background faces are present)")
     ap.add_argument("--target-latency", type=float, default=0.0,
                     help="OPT-IN jitter buffer. Hold each frame until capture_ts + this many "
                          "seconds before pushing. Trades real-time lag for smooth output: model "
@@ -670,6 +700,23 @@ def main() -> int:
         print(f"[ERR] upscaler load failed: {e}")
         return 5
 
+    # optional face restorer
+    face_enhancer = None
+    if args.face_enhance != "none":
+        try:
+            from src.face_enhance import FaceEnhancer  # type: ignore
+            face_enhancer = FaceEnhancer(
+                backend=args.face_enhance,
+                fidelity=args.face_fidelity,
+                only_center=args.face_only_center,
+                device=device,
+            )
+        except Exception as e:
+            print(f"[face] init failed ({type(e).__name__}: {e}) -> face restore disabled")
+            face_enhancer = None
+    else:
+        print("[face] face_enhance=none (disabled)")
+
     capture_q: queue.Queue = queue.Queue(maxsize=args.capture_q_size)
     out_q: queue.Queue = queue.Queue(maxsize=args.out_q_size)
     stop_event = threading.Event()
@@ -719,7 +766,7 @@ def main() -> int:
     )
     up_t = threading.Thread(
         target=upscale_worker,
-        args=(upscaler, capture_q, out_q, stop_event, args, device),
+        args=(upscaler, capture_q, out_q, stop_event, args, device, face_enhancer),
         daemon=True,
     )
 
@@ -746,6 +793,7 @@ def main() -> int:
     lat_e2e: list[float] = []
     lat_qwait: list[float] = []
     lat_upscale: list[float] = []
+    lat_face: list[float] = []
     n_processed = 0
     t_first = None
     last_report = time.time()
@@ -806,6 +854,7 @@ def main() -> int:
 
             lat_qwait.append(qwait_ms)
             lat_upscale.append(upscale_ms)
+            lat_face.append(item.face_ms)
             lat_e2e.append(e2e_ms)
 
             n_processed += 1
@@ -909,10 +958,13 @@ def main() -> int:
                 e2e_arr = np.array(lat_e2e[-args.report_every:], dtype=np.float32)
                 qw_arr = np.array(lat_qwait[-args.report_every:], dtype=np.float32)
                 up_arr = np.array(lat_upscale[-args.report_every:], dtype=np.float32)
+                face_arr = np.array(lat_face[-args.report_every:], dtype=np.float32)
+                face_seg = f" face={face_arr.mean():.1f}" if face_enhancer is not None else ""
                 print(
                     f"[prog] n={n_processed} fps={fps:.1f} "
                     f"qwait={qw_arr.mean():.1f} "
-                    f"upscale={up_arr.mean():.1f} "
+                    f"upscale={up_arr.mean():.1f}"
+                    f"{face_seg} "
                     f"e2e={e2e_arr.mean():.1f}ms (p95={np.percentile(e2e_arr,95):.1f})"
                 )
     except KeyboardInterrupt:
@@ -959,8 +1011,12 @@ def main() -> int:
     print(f"  wall time        : {elapsed:.2f}s")
     print(f"  effective fps    : {fps:.2f}")
     print(f"  upscale batch    : {args.upscale_batch}  (timeout {args.upscale_batch_timeout} ms; 0=adaptive)")
+    face = np.array(lat_face, dtype=np.float32)
     print(f"  stage timings (mean / p50 / p95 / p99 ms):")
-    stages = [("queue wait", qw), ("upscale (GPU)", up), ("end-to-end", e2e)]
+    stages = [("queue wait", qw), ("upscale (GPU)", up)]
+    if face_enhancer is not None:
+        stages.append((f"face ({args.face_enhance})", face))
+    stages.append(("end-to-end", e2e))
     for name, arr in stages:
         print(f"    {name:<20} {arr.mean():6.1f} / {np.percentile(arr,50):6.1f} / {np.percentile(arr,95):6.1f} / {np.percentile(arr,99):6.1f}")
     print(f"  e2e max         : {e2e.max():.1f} ms")
