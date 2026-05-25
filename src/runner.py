@@ -484,7 +484,9 @@ def process_video(
                     if up_writer is not None:
                         up_writer.append(sr_chunk)
                     if cmp_writer is not None:
-                        cmp_writer.append(io_utils.side_by_side(src[start:end], sr_chunk))
+                        cmp_writer.append(io_utils.side_by_side(
+                            sr_chunk, src[start:end],
+                            left_label="Upscaled", right_label="Original"))
         finally:
             if up_writer is not None:
                 up_writer.close()
@@ -584,7 +586,9 @@ def process_video(
         io_utils.encode_video(up_path, sr_full, fps=fps, crf=opts.crf,
                               encoder=encoder_name)
     if cmp_path is not None:
-        side = io_utils.side_by_side(src, sr_full)
+        side = io_utils.side_by_side(
+            sr_full, src,
+            left_label="Upscaled", right_label="Original")
         io_utils.encode_video(cmp_path, side, fps=fps, crf=opts.crf,
                               encoder=encoder_name)
 

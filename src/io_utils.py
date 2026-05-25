@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Tuple
 
+import cv2
 import imageio.v3 as iio
 import numpy as np
 from PIL import Image
@@ -144,12 +145,30 @@ def _fit(src_w: int, src_h: int, tgt_w: int, tgt_h: int) -> Tuple[int, int]:
     return max(2, int(round(src_w * r))), max(2, int(round(src_h * r)))
 
 
-def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def _draw_label(frame: np.ndarray, text: str, x: int, y_top: int,
+                font_scale: float, thickness: int) -> None:
+    """Draw label with semi-opaque dark background, in-place on RGB frame."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    pad = max(4, int(font_scale * 6))
+    x0, y0 = x, y_top
+    x1, y1 = x + tw + 2 * pad, y_top + th + 2 * pad + baseline
+    bg = frame[y0:y1, x0:x1]
+    if bg.size:
+        bg[:] = (bg.astype(np.uint16) // 2).astype(np.uint8)
+    cv2.putText(frame, text, (x0 + pad, y0 + pad + th),
+                font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def side_by_side(left: np.ndarray, right: np.ndarray,
+                 left_label: str | None = None,
+                 right_label: str | None = None) -> np.ndarray:
     """Compose left|right at the LARGER of the two heights, preserving aspect.
 
     Both inputs are uint8 RGB (N,H,W,3). Heights are matched by resizing the
     shorter video up (we want the side-by-side to show the original at full
-    resolution, not a downscale).
+    resolution, not a downscale). Optional ``left_label`` / ``right_label``
+    burn a text tag into the top-left of each half.
     """
     if left.shape[0] != right.shape[0]:
         n = min(left.shape[0], right.shape[0])
@@ -164,7 +183,19 @@ def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     if h_r != target_h:
         new_w = int(round(w_r * target_h / h_r))
         right = resize_batch(right, new_w, target_h, "bicubic")
-    return np.concatenate([left, right], axis=2)
+    out = np.ascontiguousarray(np.concatenate([left, right], axis=2))
+    if left_label or right_label:
+        h, w = out.shape[1], out.shape[2]
+        half_w = left.shape[2]
+        font_scale = max(0.7, h / 540.0)
+        thickness = max(2, int(round(font_scale * 2)))
+        for i in range(out.shape[0]):
+            frame = out[i]
+            if left_label:
+                _draw_label(frame, left_label, 10, 10, font_scale, thickness)
+            if right_label:
+                _draw_label(frame, right_label, half_w + 10, 10, font_scale, thickness)
+    return out
 
 
 def _x264_options(crf: int, preset: str = "medium") -> dict[str, str]:

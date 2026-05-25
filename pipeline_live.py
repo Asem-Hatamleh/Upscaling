@@ -368,8 +368,19 @@ class FrameItem:
     upscale_end_ts: float = 0.0
 
 
-def capture_thread(player: NodePlayer, capture_q: queue.Queue, stop_event: threading.Event, max_seq: int | None):
-    """Run NodePlayer in its own event loop; push frames w/ timestamps."""
+def capture_thread(
+    player: NodePlayer,
+    capture_q: queue.Queue,
+    stop_event: threading.Event,
+    max_seq: int | None,
+    raw_q: queue.Queue | None = None,
+):
+    """Run NodePlayer in its own event loop; push frames w/ timestamps.
+
+    If ``raw_q`` is provided (used by --compare), also tee a copy of each
+    raw pre-SR frame into it (drop-oldest) so the main thread can display
+    the source feed alongside the upscaled output.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -384,6 +395,21 @@ def capture_thread(player: NodePlayer, capture_q: queue.Queue, stop_event: threa
                 continue
             ts = time.time()
             item = FrameItem(capture_ts=ts, enqueue_ts=ts, frame=frame, seq=seq)
+            if raw_q is not None:
+                # copy so upscale_worker replacing item.frame doesn't clobber the
+                # raw view (numpy array is shared between FrameItem and source).
+                raw_copy = frame.copy()
+                try:
+                    raw_q.put_nowait(raw_copy)
+                except queue.Full:
+                    try:
+                        raw_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        raw_q.put_nowait(raw_copy)
+                    except queue.Full:
+                        pass
             try:
                 capture_q.put_nowait(item)
             except queue.Full:
@@ -532,19 +558,19 @@ def main() -> int:
     ap.add_argument("--password", default="sgQZ9Oou3CsP")
     ap.add_argument("--imei", default="867395071670570")
     ap.add_argument("--cam-id", type=int, default=4)
-    ap.add_argument("--duration", type=int, default=30)
+    ap.add_argument("--duration", type=int, default=300)
     ap.add_argument("--stream-type", default="sub", choices=["sub", "main"])
     ap.add_argument("--live", action="store_true", default=True)
     # pipeline queues
-    ap.add_argument("--capture-q-size", type=int, default=16)
-    ap.add_argument("--out-q-size", type=int, default=16)
+    ap.add_argument("--capture-q-size", type=int, default=8)
+    ap.add_argument("--out-q-size", type=int, default=8)
     ap.add_argument("--max-frames", type=int, default=0, help="stop after N frames (0=unlimited)")
     # upscaler
     ap.add_argument("--upscale-model", default="realesrgan_lite")
     ap.add_argument("--upscale-scale", type=int, default=4, choices=[2, 4],
                     help="effective output scale. model is hardcoded 4x; "
                          "scale=2 auto-halves --upscale-pre-resize so net output is 2x")
-    ap.add_argument("--upscale-pre-resize", type=float, default=1.0,
+    ap.add_argument("--upscale-pre-resize", type=float, default=0.8,
                     help="pre-resize ratio applied BEFORE SR (0.8 = shrink to 80 percent). "
                          "Combined w/ --upscale-scale to compute net scale = 4 * pre_resize")
     ap.add_argument("--upscale-dtype", choices=["fp16"], default="fp16")
@@ -562,6 +588,9 @@ def main() -> int:
     ap.add_argument("--display-max-w", type=int, default=1600,
                     help="hard cap on display window width in pixels (downscale if larger)")
     ap.add_argument("--show-raw", action="store_true", help="also show raw NodePlayer window")
+    ap.add_argument("--compare", action="store_true",
+                    help="open a second window with the raw (pre-SR) source feed alongside the upscaled output. "
+                         "Implies --display. Useful to A/B the SR result against the original.")
     ap.add_argument("--rtmp-url", default="rtmp://localhost:1935/stream", help="RTMP push URL")
     ap.add_argument("--no-rtmp", action="store_true", help="disable RTMP push")
     ap.add_argument("--start-server", action="store_true", default=True, help="auto-launch mediamtx local server")
@@ -655,9 +684,15 @@ def main() -> int:
     )
     print(f"[ws] decode_fps={decode_fps:.1f} queue_maxsize={args.queue_size}")
 
+    # --compare: tee raw frames into a small queue so main thread can
+    # display the source feed in a second window. Implies --display.
+    if args.compare:
+        args.display = True
+    raw_q: queue.Queue | None = queue.Queue(maxsize=2) if args.compare else None
+
     cap_t = threading.Thread(
         target=capture_thread,
-        args=(player, capture_q, stop_event, args.max_frames or None),
+        args=(player, capture_q, stop_event, args.max_frames or None, raw_q),
         daemon=True,
     )
     up_t = threading.Thread(
@@ -684,6 +719,7 @@ def main() -> int:
     up_t.start()
 
     _display_win_init = {"done": False}
+    _raw_win_init = {"done": False}
 
     lat_e2e: list[float] = []
     lat_qwait: list[float] = []
@@ -794,8 +830,40 @@ def main() -> int:
                 if not _display_win_init["done"]:
                     cv2.namedWindow("upscale-live", cv2.WINDOW_NORMAL)
                     cv2.resizeWindow("upscale-live", tw, th)
+                    if args.compare:
+                        # park SR window to the right; raw window will sit left.
+                        try:
+                            cv2.moveWindow("upscale-live", tw + 20, 0)
+                        except cv2.error:
+                            pass
                     _display_win_init["done"] = True
                 cv2.imshow("upscale-live", disp)
+
+                # --compare: also draw latest raw frame in a second window.
+                if args.compare and raw_q is not None:
+                    raw_frame = None
+                    # drain the small raw_q to whatever's freshest
+                    while True:
+                        try:
+                            raw_frame = raw_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    if raw_frame is not None:
+                        rh, rw = raw_frame.shape[:2]
+                        # match the SR display window's pixel size so the eye can
+                        # diff them at equal scale. Raw frame is much smaller, so
+                        # this stretches it -- exactly what the SR step does too,
+                        # but with bicubic (so SR detail shows up against bicubic).
+                        raw_disp = cv2.resize(raw_frame, (tw, th), interpolation=cv2.INTER_CUBIC)
+                        if not _raw_win_init["done"]:
+                            cv2.namedWindow("raw-source", cv2.WINDOW_NORMAL)
+                            cv2.resizeWindow("raw-source", tw, th)
+                            try:
+                                cv2.moveWindow("raw-source", 0, 0)
+                            except cv2.error:
+                                pass
+                            _raw_win_init["done"] = True
+                        cv2.imshow("raw-source", raw_disp)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     stop_event.set()
                     break
