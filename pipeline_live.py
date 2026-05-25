@@ -614,6 +614,12 @@ def main() -> int:
                          "Lower = better quality + bigger stream")
     ap.add_argument("--push-bitrate", default=None,
                     help="force constant bitrate cap (e.g. 6M, 10M). Overrides --push-crf.")
+    ap.add_argument("--target-latency", type=float, default=3.0,
+                    help="hold each frame until capture_ts + this many seconds before pushing. "
+                         "Trades real-time lag for smooth output: model jitter, batch stalls, "
+                         "and brief GPU spikes are absorbed by the buffer instead of causing "
+                         "stutter or frame skip. Typical 3-5s for broadcast-style live. "
+                         "0 = disable (legacy lowest-latency behaviour).")
     ap.add_argument("--report-every", type=int, default=30, help="latency report every N processed frames")
     ap.add_argument("--debug-log", default=None,
                     help="write per-frame timing CSV to this path. Columns: "
@@ -632,6 +638,22 @@ def main() -> int:
         f"[upscale] scale_choice={args.upscale_scale}x  native=4x  "
         f"pre_resize={args.upscale_pre_resize:.3f}  -> effective ~{effective_scale:.2f}x"
     )
+
+    # Jitter buffer sizing: if target-latency > 0 we hold each frame until
+    # capture_ts + target_latency before pushing. The out queue (and capture
+    # queue, since both feed the same buffer in different stages) must be big
+    # enough to hold that many frames, otherwise the drop-oldest policy in the
+    # workers will silently truncate the buffer and the latency target is lost.
+    if args.target_latency > 0:
+        need = int(args.target_latency * max(args.push_fps, 1.0)) + 8
+        if args.out_q_size < need:
+            args.out_q_size = need
+        if args.capture_q_size < need:
+            args.capture_q_size = need
+        print(f"[latency] target_latency={args.target_latency:.2f}s push_fps={args.push_fps:.1f} "
+              f"-> capture_q={args.capture_q_size} out_q={args.out_q_size}")
+    else:
+        print("[latency] target_latency=0 (jitter buffer disabled, lowest-latency mode)")
 
     _enable_torch_perf()
     if torch.cuda.is_available():
@@ -751,6 +773,18 @@ def main() -> int:
             now = time.time()
             if t_first is None:
                 t_first = now
+
+            # Jitter buffer: hold the frame until target_latency has elapsed
+            # since capture. Source frames arrive at source-fps cadence, so
+            # capture_ts increases monotonically at source-fps -> the deadline
+            # stream is also paced at source-fps. ffmpeg therefore sees steady
+            # output cadence even if the GPU model jittered upstream.
+            if args.target_latency > 0:
+                deadline = item.capture_ts + args.target_latency
+                wait_s = deadline - time.time()
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                now = time.time()
 
             qwait_ms = (item.upscale_start_ts - item.enqueue_ts) * 1000
             upscale_ms = (item.upscale_end_ts - item.upscale_start_ts) * 1000
@@ -931,11 +965,22 @@ def main() -> int:
         print(f"    {name:<20} {arr.mean():6.1f} / {np.percentile(arr,50):6.1f} / {np.percentile(arr,95):6.1f} / {np.percentile(arr,99):6.1f}")
     print(f"  e2e max         : {e2e.max():.1f} ms")
 
-    src_fps_assumed = 25.0
-    budget = 1000.0 / src_fps_assumed
-    headroom = (budget - e2e.mean()) / budget * 100
-    verdict = "REALTIME ✓" if e2e.mean() <= budget else "OVER BUDGET ✗"
-    print(f"  assuming {src_fps_assumed:.0f}fps source: budget={budget:.1f}ms, headroom={headroom:+.1f}% -> {verdict}")
+    if args.target_latency > 0:
+        target_ms = args.target_latency * 1000.0
+        # GPU-side cost only -- excludes the deliberate jitter-buffer wait.
+        gpu_cost = qw.mean() + up.mean()
+        gpu_budget = target_ms
+        headroom = (gpu_budget - gpu_cost) / gpu_budget * 100
+        verdict = "BUFFER HOLDS ✓" if gpu_cost <= gpu_budget else "BUFFER DRAINED ✗"
+        print(f"  target_latency   : {args.target_latency:.2f}s (jitter buffer)")
+        print(f"  GPU pipeline cost: {gpu_cost:.1f}ms (qwait+upscale)  vs buffer {gpu_budget:.0f}ms "
+              f"-> headroom={headroom:+.1f}% -> {verdict}")
+    else:
+        src_fps_assumed = 25.0
+        budget = 1000.0 / src_fps_assumed
+        headroom = (budget - e2e.mean()) / budget * 100
+        verdict = "REALTIME ✓" if e2e.mean() <= budget else "OVER BUDGET ✗"
+        print(f"  assuming {src_fps_assumed:.0f}fps source: budget={budget:.1f}ms, headroom={headroom:+.1f}% -> {verdict}")
     print(f"  out-of-order frames: {ooo_count} (frames whose seq < previous seq)")
     if debug_fh is not None:
         try:
