@@ -614,12 +614,12 @@ def main() -> int:
                          "Lower = better quality + bigger stream")
     ap.add_argument("--push-bitrate", default=None,
                     help="force constant bitrate cap (e.g. 6M, 10M). Overrides --push-crf.")
-    ap.add_argument("--target-latency", type=float, default=3.0,
-                    help="hold each frame until capture_ts + this many seconds before pushing. "
-                         "Trades real-time lag for smooth output: model jitter, batch stalls, "
-                         "and brief GPU spikes are absorbed by the buffer instead of causing "
-                         "stutter or frame skip. Typical 3-5s for broadcast-style live. "
-                         "0 = disable (legacy lowest-latency behaviour).")
+    ap.add_argument("--target-latency", type=float, default=0.0,
+                    help="OPT-IN jitter buffer. Hold each frame until capture_ts + this many "
+                         "seconds before pushing. Trades real-time lag for smooth output: model "
+                         "jitter, batch stalls, and brief GPU spikes are absorbed by the buffer "
+                         "instead of causing stutter or frame skip. Typical 3-5s for "
+                         "broadcast-style live. 0 (default) = disabled, lowest-latency mode.")
     ap.add_argument("--report-every", type=int, default=30, help="latency report every N processed frames")
     ap.add_argument("--debug-log", default=None,
                     help="write per-frame timing CSV to this path. Columns: "
